@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The NVN / NVN2 entry points as the host handles them, as one table: docs/reference/nvn-api.tsv (one row per name in dm/gfx/nvn/names.txt).
-  nvn_api_map.py            write the table and print the totals per class
-  nvn_api_map.py --check    exit 1, with the problems and a diff, when the table is not what the sources give or the judgments table has a gap or a stale row
+  nvn_api_map.py            write the table and the picture of it (docs/reference/nvn-api.svg; --svg <file> writes the picture elsewhere) and print the totals per class
+  nvn_api_map.py --check    exit 1, with the problems and a diff, when the table or the picture is not what the sources give or the judgments table has a gap or a stale row
   nvn_api_map.py --gaps ... print, for one game, the names it calls or carries that the host does not fully handle (nothing is written; the game's inputs are not kept)
 docs/reference/nvn-api.md says what the columns and classes mean.
 
@@ -28,6 +28,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 NVN = 'dm/gfx/nvn'
 TABLE = 'docs/reference/nvn-api.tsv'
+SVG = 'docs/reference/nvn-api.svg'
 JUDGMENTS = 'docs/reference/nvn-api-judgments.tsv'
 HEAD = ['name', 'category', 'class', 'op', 'handler', 'replay', 'notes']
 JHEAD = ['name', 'class', 'anchor', 'note']
@@ -274,6 +275,62 @@ def summary(rows):
     return '%d names: %s' % (len(rows), ', '.join('%s %d' % (c, t[c]) for c in list(CLASSES) + [k for k in t if k not in CLASSES] if t.get(c)))
 
 
+# the picture: one cell per name, grouped by category, on its own dark background so that it reads the same on GitHub's light and dark pages
+COLORS = {'immediate': '#2ea043', 'recorded': '#2ea043', 'partial': '#7ee787', 'stub-ok': '#2d9a8c', 'stub-risky': '#d29922', 'missing': '#5b6472', 'unjudged': '#f85149'}
+BG, FG, DIM = '#0d1117', '#e6edf3', '#9da7b3'
+FONT = "-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif"
+
+
+def svg(rows):
+    """The coverage map as an SVG string: plain string building, no scripts, fonts or references; the same rows give the same bytes."""
+    esc = lambda x: x.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;')
+    W, PAD, GAP, CELL, PITCH = 960, 16, 24, 12, 14
+    t = totals(rows); n = len(rows)
+    translated = t.get('immediate', 0) + t.get('recorded', 0)
+    out = []
+    text = lambda x, y, size, fill, body, anchor='start', weight='normal': out.append(
+        '<text x="%d" y="%d" font-family="%s" font-size="%d" font-weight="%s" fill="%s" text-anchor="%s">%s</text>' % (x, y, FONT, size, weight, fill, anchor, esc(body)))
+    text(PAD, 34, 22, FG, 'NVN / NVN2 API coverage in the nxnative host', weight='bold')
+    text(PAD, 58, 13, DIM, '%d entry points: %d translated (%.1f%%), %d partial, %d stubbed, %d missing' % (n, translated, 100.0 * translated / n, t.get('partial', 0),
+                                                                                                    t.get('stub-ok', 0) + t.get('stub-risky', 0), t.get('missing', 0)))
+    # the overall bar: translated / partial / stub-ok / stub-risky / missing as proportions of the names
+    x, bw = float(PAD), W - 2 * PAD
+    for key, cnt in (('translated', translated), ('partial', t.get('partial', 0)), ('stub-ok', t.get('stub-ok', 0)), ('stub-risky', t.get('stub-risky', 0)), ('missing', t.get('missing', 0))):
+        w = bw * cnt / n
+        if cnt: out.append('<rect x="%.2f" y="72" width="%.2f" height="14" fill="%s"><title>%s: %d of %d</title></rect>' % (x, w, COLORS['immediate' if key == 'translated' else key], key, cnt, n))
+        x += w
+    # the legend
+    lx = PAD
+    for key, label, cnt in (('immediate', 'immediate', t.get('immediate', 0)), ('recorded', 'recorded', t.get('recorded', 0)), ('partial', 'partial', t.get('partial', 0)),
+                            ('stub-ok', 'stub-ok', t.get('stub-ok', 0)), ('stub-risky', 'stub-risky', t.get('stub-risky', 0)), ('missing', 'missing', t.get('missing', 0))):
+        out.append('<rect x="%d" y="102" width="12" height="12" fill="%s"/>' % (lx, COLORS[key]))
+        text(lx + 18, 112, 12, FG, '%s %d' % (label, cnt))
+        lx += 154
+    # the groups: two columns, each group goes under the shorter one; a group is a header line and rows of cells ordered by name
+    cats = {}
+    for r in rows: cats.setdefault(r['category'], []).append(r)
+    colw = (W - 2 * PAD - GAP) // 2
+    per_row = (colw + CELL - PITCH) // PITCH
+    heights, top = [0, 0], 134
+    for cat in sorted(cats):
+        members = sorted(cats[cat], key=lambda r: r['name'])
+        c = 0 if heights[0] <= heights[1] else 1
+        gx, gy = PAD + c * (colw + GAP), top + heights[c]
+        done = sum(1 for r in members if r['cls'] in ('immediate', 'recorded'))
+        text(gx, gy + 14, 13, FG, cat, weight='bold')
+        text(gx + colw, gy + 14, 13, DIM, '%d/%d' % (done, len(members)), anchor='end')
+        out.append('<g>')
+        for i, r in enumerate(members):
+            out.append('<rect x="%d" y="%d" width="%d" height="%d" rx="2" fill="%s"><title>%s: %s</title></rect>' % (gx + i % per_row * PITCH, gy + 24 + i // per_row * PITCH, CELL, CELL, COLORS.get(r['cls'], COLORS['unjudged']), esc(r['name']), r['cls']))
+        out.append('</g>')
+        heights[c] += 24 + (len(members) + per_row - 1) // per_row * PITCH + 18
+    H = top + max(heights) + 4
+    text(PAD, H + 12, 11, DIM, 'translated = immediate or recorded. A cell is one name of dm/gfx/nvn/names.txt; hover for its name and class. Generated by dm/tools/nvn_api_map.py.')
+    H += 24
+    head = '<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d" viewBox="0 0 %d %d" role="img" aria-label="NVN / NVN2 API coverage map">\n<rect width="%d" height="%d" fill="%s"/>\n' % (W, H, W, H, W, H, BG)
+    return head + '\n'.join(out) + '\n</svg>\n'
+
+
 def gaps(rows, args):
     """Print the names one game calls (from logs or a names file) or carries (from a module) that the host does not fully handle."""
     called, carried = set(), set()
@@ -293,6 +350,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0], formatter_class=argparse.RawDescriptionHelpFormatter, epilog='\n'.join(__doc__.split('\n')[1:]))
     ap.add_argument('--check', action='store_true', help='exit 1 when the table is stale or the judgments have a gap or a stale row')
     ap.add_argument('--gaps', action='store_true', help='print one game\'s gaps (with --game-log, --game-names, --game-binary); writes nothing')
+    ap.add_argument('--svg', metavar='FILE', help='write the picture of the table here instead of docs/reference/nvn-api.svg (not with --check)')
     ap.add_argument('--repo', default=str(REPO), help='the repository to read (default: this one)')
     ap.add_argument('--game-log', action='append', default=[], metavar='PATH', help='a run log, or a folder of them: the names the host reported as unimplemented')
     ap.add_argument('--game-names', action='append', default=[], metavar='FILE', help='any text in which the nvn names a game called appear')
@@ -303,16 +361,18 @@ def main(argv=None):
     text = render(rows)
     if a.gaps:
         gaps(rows, a); return 0
-    table = repo / TABLE
+    table, picture = repo / TABLE, repo / SVG
     if a.check:
-        have = table.read_text(encoding='utf-8') if table.is_file() else ''
-        if have != text:
-            problems.append('%s is not what the sources give: run dm/tools/nvn_api_map.py and commit the result' % TABLE)
-            d = list(difflib.unified_diff(have.split('\n'), text.split('\n'), 'committed ' + TABLE, 'generated', lineterm='', n=0))
-            print('\n'.join(d[:60] + (['... %d more diff lines' % (len(d) - 60)] if len(d) > 60 else [])))
+        for path, rel, want in ((table, TABLE, text), (picture, SVG, svg(rows))):
+            have = path.read_text(encoding='utf-8') if path.is_file() else ''
+            if have != want:
+                problems.append('%s is not what the sources give: run dm/tools/nvn_api_map.py and commit the result' % rel)
+                d = list(difflib.unified_diff(have.split('\n'), want.split('\n'), 'committed ' + rel, 'generated', lineterm='', n=0))
+                print('\n'.join(d[:60] + (['... %d more diff lines' % (len(d) - 60)] if len(d) > 60 else [])))
         for p in problems: print('nvn_api_map: ' + p)
         if not problems: print('nvn_api_map: ok, ' + summary(rows))
         return 1 if problems else 0
+    Path(a.svg).write_text(svg(rows), encoding='utf-8') if a.svg else picture.write_text(svg(rows), encoding='utf-8')
     table.write_text(text, encoding='utf-8')
     for p in problems: print('nvn_api_map: ' + p)
     print(summary(rows))
