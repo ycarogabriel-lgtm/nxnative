@@ -1,10 +1,14 @@
 # NVN API coverage
 
+![NVN / NVN2 API coverage map: one cell per entry point, grouped by category](nvn-api.svg)
+
+One cell per entry point: strong green is translated (immediate or recorded), light green partial, teal a stub that is safe to ignore, amber a stub that may not be, grey missing. Hover a cell for its name and class. The picture is generated with the table.
+
 How the host handles each NVN / NVN2 entry point, one row per name in `dm/gfx/nvn/names.txt`: [nvn-api.tsv](nvn-api.tsv). It answers "is this call implemented, recorded for the replay, ignored or missing?" without reading `hle_nvn.c`, and it tells a game's translation work which calls to look at first. The idea of a generated, CI-checked coverage map with a status vocabulary follows what other porting projects publish, AnyPS5's progress map being the inspiration; the table, tool and vocabulary here are this repository's own. Entries on how an entry point behaves are in [nvn-objects.md](nvn-objects.md) and [rendering.md](rendering.md).
 
 ## The table and how it is kept
 
-`python3 dm/tools/nvn_api_map.py` writes the table and prints the totals; `--check` exits 1, with a diff, when the table is not what the sources give. `dm/tools/tests/test_nvn_api_map.py` runs the same check in CI (the tool tests of `tests.yml`), so a change to the NVN layer that moves a call from one class to another comes with the table's new row. It reads only this repository (no game, no GPU) and has no line numbers in it, so an edit that moves a handler does not change the table.
+`python3 dm/tools/nvn_api_map.py` writes the table and the picture ([nvn-api.svg](nvn-api.svg), a plain SVG with its own dark background; `--svg <file>` writes it elsewhere) and prints the totals; `--check` exits 1, with a diff, when either is not what the sources give. `dm/tools/tests/test_nvn_api_map.py` runs the same check in CI (the tool tests of `tests.yml`), so a change to the NVN layer that moves a call from one class to another comes with the table's new row. It reads only this repository (no game, no GPU) and has no line numbers in it, so an edit that moves a handler does not change the table.
 
 | Column | Where it comes from |
 |---|---|
