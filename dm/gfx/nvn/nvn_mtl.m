@@ -2924,9 +2924,10 @@ static int tex_atomic_alias(id<MTLTexture> base) {
         || pf == MTLPixelFormatRG16Unorm || pf == MTLPixelFormatRG16Snorm || pf == MTLPixelFormatRG16Uint || pf == MTLPixelFormatRG16Sint || pf == MTLPixelFormatRG16Float || pf == MTLPixelFormatR32Float;
     return bytes32 && (base.textureType == MTLTextureType2D || base.textureType == MTLTextureType2DArray) && base.sampleCount == 1 && base.storageMode == MTLStorageModePrivate && !base.buffer && !base.isSparse;
 }
+static uint64_t g_fs_nomap, g_fs_repack, g_fs_repack_bytes;   // DM_NVN_FMT_SUMMARY: textures with no Metal format (not made), and uploads repacked on the CPU (RGB565 family / RGBA4: same width, bits moved)
 static MTLTextureDescriptor *tex_desc(const tex_t *t, int packaged) {
     uint32_t pf = 0; uint8_t swz[4];
-    if (!nvn_fmt_to_mtl(t->d.format, &pf, swz) || !pf) { RED_ONCE(0, "texture format %#x has no Metal equivalent (first case)", t->d.format); return nil; }
+    if (!nvn_fmt_to_mtl(t->d.format, &pf, swz) || !pf) { g_fs_nomap++; RED_ONCE(0, "texture format %#x has no Metal equivalent (first case)", t->d.format); return nil; }
     // Metal's limits: 16384 in 2D, 2048 in 3D, 2048 array layers; beyond them Metal aborts the process on an assertion, so they are caught here with a red line
     if (t->d.width > 16384 || t->d.height > 16384 || t->d.depth > 2048) { RED_ONCE(71, "texture size exceeds Metal limits: %u×%u×%u levels %u format %#x target %d (first case ser=%llu)", t->d.width, t->d.height, t->d.depth, t->d.levels, t->d.format, t->d.target, (unsigned long long)t->serial); return nil; }
     MTLTextureDescriptor *d = [MTLTextureDescriptor new];
@@ -3542,6 +3543,7 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
         total += (size_t)((w + bw - 1) / bw) * bpb * ((h + bh - 1) / bh) * z * n;
     }
     g_bp_up_bytes += total;
+    if (rb_shift) { g_fs_repack++; g_fs_repack_bytes += total; }
     void *mb; uint64_t mo;
     // A texture in a large pool (BIG_MIN) or one that holds only textures is read through a buffer of its own, held by the upload batch: a one-time read must not leave that memory wired for good
     id<MTLBuffer> upsrc = nil; unsigned src_batch = 0;   // the upload batch that holds upsrc (g_up_seq)
@@ -4870,10 +4872,81 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct, int *in_storage) {
     else if (tu) tu_register(mt, t->serial);
     return got;
 }
+// Diagnostic DM_NVN_FMT_SUMMARY=<frame> (1: frame 3000): once, at the first memory readout at or after that frame, one inventory of the Metal textures the host holds, by format: how many go to the
+// GPU as the game's own block-compressed ASTC / BC blocks (nvn_fmt_to_mtl maps them one to one; the upload only moves blocks, pkg_upload_ / the GPU deswizzle) against uncompressed ones, how many bytes
+// each takes (allocatedSize), the formats that take the most, and the render targets with and without the conditions Apple's lossless framebuffer compression needs (private storage, optimized contents
+// allowed, no format-view, no shader-write usage, not buffer-backed or sparse: the rule of DM_NVN_PASSMAP's ll column; Metal does not say whether compression is on, so it is an inference from the
+// flags). Reads textures only: nothing about how they are made or used changes. A texture in the serial table, the ghost ring or the shared-texture table counts once, by its base texture; textures
+// held elsewhere (the render-target heap recycler's, spares, swapchain) are not in it
+static int fmt_summary_frame(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_FMT_SUMMARY"); v = !e ? 0 : atoi(e) > 1 ? atoi(e) : *e && *e != '0' ? 3000 : 0; if (v) MLOG("DM_NVN_FMT_SUMMARY: one texture format inventory at the first memory readout from frame %d (diagnostic)", v); } return v; }
+enum { FS_PF = 320, FS_REASONS = 6 };
+typedef struct { uint64_t n, bytes; } fs_cnt;
+static fs_cnt g_fs_pf[2][FS_PF + 1];   // [0] uploaded from guest bytes (NvPkg), [1] on the GPU's own storage (shared / aliased); by MTLPixelFormat, the last slot all others
+static fs_cnt g_fs_rt_ok, g_fs_rt_no[FS_REASONS]; static fs_cnt g_fs_tot[2], g_fs_astc[2], g_fs_bc[2], g_fs_depth[2];
+static const char *const g_fs_reason_name[FS_REASONS] = {"shared storage", "sparse", "buffer-backed", "contents optimization off", "format-view usage", "shader-write usage"};
+static int fs_ll_reason(id<MTLTexture> t) {   // -1: eligible for lossless compression; else the index of the first condition it lacks
+    if (t.storageMode != MTLStorageModePrivate) return 0;
+    if (t.isSparse) return 1;
+    if (t.buffer) return 2;
+    if (!t.allowGPUOptimizedContents) return 3;
+    if (t.usage & MTLTextureUsagePixelFormatView) return 4;
+    if (t.usage & MTLTextureUsageShaderWrite) return 5;
+    return -1;
+}
+static void fmt_summary(unsigned long long frame) {
+    static int done; if (done) return; done = 1;
+    CFMutableSetRef seen = CFSetCreateMutable(NULL, 0, NULL); __block unsigned nt = 0;
+    @autoreleasepool {
+        pthread_mutex_lock(&g_smu);
+        void (^one)(void *) = ^(void *vp) {   // each texture the serial tables (nvn_owner.m) or the sharing table hold, once
+            id v = (__bridge id)vp; id<MTLTexture> t = nil; int pkg = 0;
+            if ([v isKindOfClass:[NvPkg class]]) { t = ((NvPkg *)v)->tex; pkg = 1; }
+            else if ([v conformsToProtocol:@protocol(MTLTexture)]) t = v;
+            if (!t) return;
+            if (t.parentTexture) t = t.parentTexture;
+            if (CFSetContainsValue(seen, (__bridge const void *)t)) return;
+            CFSetAddValue(seen, (__bridge const void *)t); nt++;
+            MTLPixelFormat pf = t.pixelFormat; uint64_t sz = t.allocatedSize; int k = pkg ? 0 : 1;
+            fs_cnt *c = &g_fs_pf[k][pf < FS_PF ? pf : FS_PF]; c->n++; c->bytes += sz; g_fs_tot[k].n++; g_fs_tot[k].bytes += sz;
+            if (pf >= MTLPixelFormatASTC_4x4_sRGB && pf <= MTLPixelFormatASTC_12x12_HDR) { g_fs_astc[k].n++; g_fs_astc[k].bytes += sz; }
+            else if (pf >= MTLPixelFormatBC1_RGBA && pf <= MTLPixelFormatBC7_RGBAUnorm_sRGB) { g_fs_bc[k].n++; g_fs_bc[k].bytes += sz; }
+            else if (pf == MTLPixelFormatDepth16Unorm || pf == MTLPixelFormatDepth32Float || pf == MTLPixelFormatStencil8 || pf == MTLPixelFormatDepth32Float_Stencil8) { g_fs_depth[k].n++; g_fs_depth[k].bytes += sz; }
+            if (t.usage & MTLTextureUsageRenderTarget) { int r = fs_ll_reason(t); fs_cnt *rc = r < 0 ? &g_fs_rt_ok : &g_fs_rt_no[r]; rc->n++; rc->bytes += sz; }
+        };
+        own_each_locked(^(uint64_t serial, id o, int ghost) { (void)serial; (void)ghost; one((__bridge void *)o); });
+        own_alias_each_locked(^(const alias_key *k, id o) { (void)k; one((__bridge void *)o); });
+        pthread_mutex_unlock(&g_smu);
+    }
+    CFRelease(seen);
+    static const char *const k_name[2] = {"uploaded from guest bytes", "on GPU storage"};
+    for (int k = 0; k < 2; k++) {
+        uint64_t unc_n = g_fs_tot[k].n - g_fs_astc[k].n - g_fs_bc[k].n - g_fs_depth[k].n, unc_b = g_fs_tot[k].bytes - g_fs_astc[k].bytes - g_fs_bc[k].bytes - g_fs_depth[k].bytes;
+        MLOG("format summary frame %llu, textures %s: %llu in all (%llu MB): ASTC blocks as they are %llu (%llu MB), BC blocks as they are %llu (%llu MB), uncompressed colour %llu (%llu MB), depth / stencil %llu (%llu MB)",
+             frame, k_name[k], (unsigned long long)g_fs_tot[k].n, (unsigned long long)(g_fs_tot[k].bytes >> 20), (unsigned long long)g_fs_astc[k].n, (unsigned long long)(g_fs_astc[k].bytes >> 20),
+             (unsigned long long)g_fs_bc[k].n, (unsigned long long)(g_fs_bc[k].bytes >> 20), (unsigned long long)unc_n, (unsigned long long)(unc_b >> 20), (unsigned long long)g_fs_depth[k].n, (unsigned long long)(g_fs_depth[k].bytes >> 20));
+        for (int top = 0; top < 10; top++) {   // the formats that take the most bytes, largest first
+            int best = -1; for (int f = 0; f <= FS_PF; f++) if (g_fs_pf[k][f].n && (best < 0 || g_fs_pf[k][f].bytes > g_fs_pf[k][best].bytes)) best = f;
+            if (best < 0) break;
+            MLOG("format summary %s: Metal format %d%s: %llu textures, %llu MB", k_name[k], best == FS_PF ? -1 : best, best >= MTLPixelFormatASTC_4x4_sRGB && best <= MTLPixelFormatASTC_12x12_HDR ? " (ASTC)" : best >= MTLPixelFormatBC1_RGBA && best <= MTLPixelFormatBC7_RGBAUnorm_sRGB ? " (BC)" : "",
+                 (unsigned long long)g_fs_pf[k][best].n, (unsigned long long)(g_fs_pf[k][best].bytes >> 20));
+            g_fs_pf[k][best] = (fs_cnt){0, 0};
+        }
+    }
+    uint64_t rn = g_fs_rt_ok.n, rb = g_fs_rt_ok.bytes; for (int r = 0; r < FS_REASONS; r++) { rn += g_fs_rt_no[r].n; rb += g_fs_rt_no[r].bytes; }
+    MLOG("format summary render targets: %llu (%llu MB); with the conditions for lossless compression %llu (%llu MB); without %llu (%llu MB): %s %llu (%llu MB), %s %llu (%llu MB), %s %llu (%llu MB), %s %llu (%llu MB), %s %llu (%llu MB), %s %llu (%llu MB)",
+         (unsigned long long)rn, (unsigned long long)(rb >> 20), (unsigned long long)g_fs_rt_ok.n, (unsigned long long)(g_fs_rt_ok.bytes >> 20), (unsigned long long)(rn - g_fs_rt_ok.n), (unsigned long long)((rb - g_fs_rt_ok.bytes) >> 20),
+         g_fs_reason_name[0], (unsigned long long)g_fs_rt_no[0].n, (unsigned long long)(g_fs_rt_no[0].bytes >> 20), g_fs_reason_name[1], (unsigned long long)g_fs_rt_no[1].n, (unsigned long long)(g_fs_rt_no[1].bytes >> 20),
+         g_fs_reason_name[2], (unsigned long long)g_fs_rt_no[2].n, (unsigned long long)(g_fs_rt_no[2].bytes >> 20), g_fs_reason_name[3], (unsigned long long)g_fs_rt_no[3].n, (unsigned long long)(g_fs_rt_no[3].bytes >> 20),
+         g_fs_reason_name[4], (unsigned long long)g_fs_rt_no[4].n, (unsigned long long)(g_fs_rt_no[4].bytes >> 20), g_fs_reason_name[5], (unsigned long long)g_fs_rt_no[5].n, (unsigned long long)(g_fs_rt_no[5].bytes >> 20));
+    MLOG("format summary conversions: textures decoded to another format on the CPU: none (no such path: ASTC / BC / colour formats go up as the game's bytes, deswizzled only); RGB565-family / RGBA4 uploads repacked on the CPU %llu (%llu MB); textures with no Metal format, not made %llu; "
+         "upgrades that re-made a texture with extra usage (tex_upgrade) %llu; %u distinct base textures counted",
+         (unsigned long long)g_fs_repack, (unsigned long long)(g_fs_repack_bytes >> 20), (unsigned long long)g_fs_nomap, (unsigned long long)g_pfv_upgrades, nt);
+}
 // Memory readout line (always on, low frequency, capped): resident memory, GPU allocated, deferred-release queue, residency set object count, registered memory pools / peak / tracking table capacity, cumulative texture re-uploads.
 // Purpose: pin down "crashes with no log". The system gives no notice before killing a process for memory, so only readouts left beforehand can show which number kept climbing.
 // Called by the frame hook every 300 frames; printed only when resident or GPU allocated changed by ≥ 64 MB since the last line, otherwise one line every 3000 frames; capped at 400 lines per game. All integers (the frame hook runs on the guest thread's small stack, so no floating-point formatting)
 void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
+    { int fsf = fmt_summary_frame(); if (fsf && frame >= (unsigned long long)fsf) fmt_summary(frame); }
     static unsigned long long last_rss, last_gpu, last_frame; static int lines; unsigned long long gpu = (unsigned long long)(g_dev.currentAllocatedSize >> 20);
     unsigned long long dr = rss_mb > last_rss ? rss_mb - last_rss : last_rss - rss_mb, dg = gpu > last_gpu ? gpu - last_gpu : last_gpu - gpu;
     if (lines >= 400 || (lines && dr < 64 && dg < 64 && frame - last_frame < 3000)) return; lines++; last_rss = rss_mb; last_gpu = gpu; last_frame = frame;
@@ -18331,3 +18404,64 @@ void mem_census(const char *why) { @autoreleasepool {
 #include "nvn_capture.inc"   // DM_NVN_CAPTURE (one frame for dm/gfx/tests/nvn_replay)
 #include "nvn_ndve.inc"      // DM_NDVE_ENGINE (nn::ndve's movie network)
 #pragma clang attribute pop
+// DM_NVN_MEM_BREAKDOWN=<every N frames> (off by default): one line naming where the host's Metal memory sits, by cache / pool, so a single run shows which one grows. Read-only: nothing is
+// retained past the call, nothing released. Purpose: a 20 minute play session grew GPU allocated from 2.8 to 9 GB while the game's own texture pool stayed at 2.1 GB, and the
+// existing readout (mtl_mem_stat) counts entries but not bytes. Sizes are Metal's allocatedSize / length; a texture placed in a heap is counted through its heap (never twice).
+// Called from the frame hook (hle_nvn.c) on a guest thread, so it has an autorelease pool of its own, like mtl_mem_stat
+void mtl_mem_breakdown(unsigned long long frame, unsigned long long rss_mb) { @autoreleasepool {
+    // 1. the residency set, by kind
+    unsigned long set_n = 0, set_buf_n = 0, set_tex_n = 0, set_heap_n = 0; uint64_t set_buf_b = 0, set_tex_b = 0, set_heap_b = 0, set_big_buf_b = 0;
+    pthread_mutex_lock(&g_res_mu);
+    for (id o in g_res_objects.allObjects) { set_n++;
+        if ([o conformsToProtocol:@protocol(MTLHeap)]) { set_heap_n++; set_heap_b += ((id<MTLHeap>)o).currentAllocatedSize; }
+        else if ([o conformsToProtocol:@protocol(MTLBuffer)]) { id<MTLBuffer> b = o; set_buf_n++; set_buf_b += b.length; if (b.length >= (16u << 20)) set_big_buf_b += b.length; }
+        else if ([o conformsToProtocol:@protocol(MTLTexture)]) { id<MTLTexture> t = o; if (!t.parentTexture) { set_tex_n++; set_tex_b += t.allocatedSize; } } }
+    pthread_mutex_unlock(&g_res_mu);
+    // 2. the sharing table (g_alias), split by whether a live or finalized serial still names the texture, and by how long nobody looked it up
+    __block unsigned al_n = 0, al_unref_n = 0, al_idle_n = 0; __block uint64_t al_b = 0, al_unref_b = 0, al_idle_b = 0, al_rt_b = 0;
+    unsigned ser_n = 0, ghost_n = 0; __block unsigned pk_n = 0, ot_n = 0; __block uint64_t pk_b = 0, ot_b = 0;
+    pthread_mutex_lock(&g_smu);
+    CFMutableSetRef held = CFSetCreateMutable(NULL, 0, NULL), seen = CFSetCreateMutable(NULL, 0, NULL);
+    { own_stats os = own_stats_locked(); ser_n = os.live; ghost_n = os.ghost; }
+    own_each_locked(^(uint64_t serial, id o, int ghost) { (void)serial; (void)ghost; CFSetAddValue(held, (__bridge const void *)o); });
+    own_alias_each_locked(^(const alias_key *k, id o) {
+        void *v = (__bridge void *)o; id<MTLTexture> t = (id<MTLTexture>)o; uint64_t sz = t.allocatedSize; al_n++; al_b += sz; CFSetAddValue(seen, v);
+        if (t.heap) al_rt_b += sz;
+        if (!CFSetContainsValue(held, v)) { al_unref_n++; al_unref_b += sz;
+            uint64_t last = own_alias_seen_locked(k);
+            if (!last || g_fence + 1 - last > 600) { al_idle_n++; al_idle_b += sz; } } });
+    // 3. what the serial tables (live and ghost) hold beside the sharing table: packaged textures (NvPkg: the upload and its spare), other textures
+    own_each_locked(^(uint64_t serial, id o, int ghost) { (void)serial; (void)ghost; const void *v = (__bridge const void *)o; if (CFSetContainsValue(seen, v)) return; CFSetAddValue(seen, v);
+        if ([o isKindOfClass:[NvPkg class]]) { NvPkg *p = o; pk_n++; if (p->tex) pk_b += p->tex.allocatedSize; if (p->spare) pk_b += p->spare.allocatedSize; }
+        else if ([o conformsToProtocol:@protocol(MTLTexture)]) { id<MTLTexture> t = o; if (!t.parentTexture) { ot_n++; ot_b += t.allocatedSize; } } });
+    CFRelease(held); CFRelease(seen);
+    pthread_mutex_unlock(&g_smu);
+    // 4. render-target heaps: live ones are heaps of textures still named; waiting ones are the recycling list (bounded by RH_CAP / RH_IDLE_NS)
+    os_unfair_lock_lock(&g_rh_lk); unsigned rh_wait_n = g_rh_n; uint64_t rh_wait_b = g_rh_bytes; os_unfair_lock_unlock(&g_rh_lk);
+    long rh_live = (long)(atomic_load(&g_rh_made) - atomic_load(&g_rh_trimmed));
+    // 5. guest memory pools wrapped as buffers (they are the guest's own pages: counted in GPU allocated, not extra memory) and the freed ones still alive
+    unsigned pl_n = 0, pl_res_n = 0, dead_n = 0; uint64_t pl_b = 0, pl_res_b = 0, dead_b = 0;
+    pthread_mutex_lock(&g_mu);
+    for (int k = 0; k < g_npool; k++) { uint64_t sz = g_pools[k].hi - g_pools[k].lo; pl_n++; pl_b += sz; if (g_pools[k].res) { pl_res_n++; pl_res_b += sz; } }
+    for (id<MTLBuffer> b in g_dead_pools.allObjects) { dead_n++; dead_b += b.length; }
+    unsigned arenas = (unsigned)g_arenas.count, sub_arenas = (unsigned)g_sub_arenas.count, c1 = (unsigned)g_c1_banks.count, up_tex = (unsigned)g_up_texs.count, tbs_views = (unsigned)g_tbs_views.count;
+    pthread_mutex_unlock(&g_mu);
+    // 6. staging: the upload block in use, swapped-out blocks still alive
+    unsigned up_old_n = 0; uint64_t up_old_b = 0; for (id<MTLBuffer> b in g_up_old.allObjects) { up_old_n++; up_old_b += b.length; }
+    uint64_t up_cur = g_up_block ? g_up_block.length : 0, tbs = g_tbs_blk ? g_tbs_blk.length : 0;
+    pthread_mutex_lock(&g_deferred_mu); unsigned long drq = (unsigned long)g_deferred.count; pthread_mutex_unlock(&g_deferred_mu);
+    unsigned vn; uint64_t vh, vm; mtl_vc_stats(&vn, &vh, &vm);
+#define MB(x) ((unsigned long long)((x) >> 20))
+    MLOG("[membreakdown] frame %llu: resident %llu MB, GPU allocated %llu MB; residency set %lu objects: buffers %lu = %llu MB (of them >= 16 MB each %llu MB), textures %lu = %llu MB, heaps %lu = %llu MB; "
+         "sharing table %u textures = %llu MB (%llu MB placed in render-target heaps; unreferenced %u = %llu MB, of those not looked up in 600 submissions %u = %llu MB); "
+         "serial table %u + ghost %u entries, packaged textures held %u = %llu MB, other textures held beside the sharing table %u = %llu MB; "
+         "render-target heaps live %ld, waiting %u = %llu MB; memory pools %u = %llu MB (resident %u = %llu MB), freed but alive %u = %llu MB; "
+         "upload block %llu MB, swapped-out blocks alive %u = %llu MB, texture-buffer shadow block %llu MB, arenas %u + %u in submission, constant banks %u, upload targets kept %u, shadow views %u; "
+         "texture views cached on %u textures; deferred-release queue %lu",
+         frame, rss_mb, MB(g_dev.currentAllocatedSize), set_n, set_buf_n, MB(set_buf_b), MB(set_big_buf_b), set_tex_n, MB(set_tex_b), set_heap_n, MB(set_heap_b),
+         al_n, MB(al_b), MB(al_rt_b), al_unref_n, MB(al_unref_b), al_idle_n, MB(al_idle_b),
+         ser_n, ghost_n, pk_n, MB(pk_b), ot_n, MB(ot_b),
+         rh_live, rh_wait_n, MB(rh_wait_b), pl_n, MB(pl_b), pl_res_n, MB(pl_res_b), dead_n, MB(dead_b),
+         MB(up_cur), up_old_n, MB(up_old_b), MB(tbs), arenas, sub_arenas, c1, up_tex, tbs_views, vn, drq);
+#undef MB
+} }
