@@ -1591,6 +1591,8 @@ static void rp_end_at(const char *fn, int line);
 // Every render pass end names its call site in a pass dump (E <pass> pass ends in <function>:<line>): a pass that ends with no record of its own was found only by reading the code (Splatoon Raiders'
 // third boss stage, about 1,500 one-draw passes a frame on its ink map, dm/games/0400380020056000/README.md). The line is in the file that holds the function (this one or an .inc it includes), at the build the log came from
 #define rp_end() rp_end_at(__func__, __LINE__)
+static const char *g_pm_why; static uint32_t g_pm_cc_why;   // DM_NVN_PASSMAP: why the next rp_end happens (set just before it; "host:" / "jogo:"), and the cause of the copies the open copy encoder takes (1 feedback snapshot, 2 depth copy, 3 uniform update)
+#define PM_WHY(s) (g_pm_why = (s))
 static void geo_mesh_flush_pass(void);   // a waiting run of mesh draws is drawn before its pass ends (nvn_geometry.inc)
 // DM_NVN_PASSGPU_SERIAL=1 (for measurement): before creating each encoder on the main command buffer, encode 'signal n+1 → wait for signal n+1' - the signal is only raised once all prior work has completed,
 // so the following encoder starts only after the previous one has fully finished; on TBDR passes no longer overlap in the pipeline, and the per-pass start-to-end span of DM_NVN_PASSGPU is that pass's exclusive time (the whole-frame total is inflated; look only at relative cost)
@@ -1651,6 +1653,205 @@ static const void *g_gp_e;   // the encoder g_gp_cur belongs to: m4_end also end
 static _Atomic int g_gp_busy;   // a periodic profile's report has not been printed yet: the heap is still being read
 static uint64_t g_bw_load, g_bw_store, g_gp_bw_l0, g_gp_bw_s0;   // the bandwidth ledger (defined with the pass statistics below) and its values at the last render pass end
 static uint64_t g_stat_pass, g_stat_draw; static _Atomic uint64_t g_cur_frame; static uint32_t g_seg; static uint32_t g_gp_copies, g_gp_disp, g_gp_ubd;   // copies / dispatches encoded (for the compute encoders' labels)
+// DM_NVN_PASSMAP=<frame>[,N] (diagnostic, off by default): the pass map of frames <frame> .. <frame>+N (N default 0), one TSV row per encoder of the main command buffers in order, written to
+// DM_NVN_PASSMAP_OUT (default $DM_ROOT/passmap.tsv) with a '#' summary after each frame. It sits beside DM_NVN_GPUPROF and uses the same Metal 4 relaxed timestamps (a counter heap, written when an
+// encoder begins and ends; nothing is serialized beyond the barriers the replay sets), but keeps its own ring of PM_SLOTS frames so that consecutive frames can be sampled: a frame is skipped whole
+// when no slot is free (its report has not come back yet). Beyond GPUPROF's columns a row has: the category, the idle gap before the encoder, whether it opened a command buffer cut (split submit),
+// every attachment's format, size, load and store action, bytes and the usage flags that keep or drop lossless compression (ll), the draws and the mesh / task draws, the dominant vertex / fragment
+// shaders, who ended the pass (a host reason, a game reason or the call site), the copies of a copy encoder by cause (feedback snapshot, depth copy, uniform update) and the compute shader. Each
+// compute dispatch gets an encoder of its own in sampled frames (DM_NVN_PASSMAP_OWN=0 keeps them shared). The scene size that separates prepass / shadows / scene / post is the colour + depth pass with the most
+// draws (DM_NVN_PASSMAP_SCENE=WxH sets it); DM_NVN_PASSMAP_NDSR=<shader key prefix>[,...] names the upscaler's compute shader (default fa3033d05c0a41d6)
+enum { PM_SLOTS = 4, PM_ENC = GP_MAX / 2, PM_ATT = 10, PM_DOM = 6, PM_CC_N = 4 };   // cc: copies by cause: 0 other, 1 feedback snapshot, 2 depth copy, 3 uniform update
+typedef struct { char k; uint8_t idx, ms, load, store, usage, view, ll; uint16_t fmt, bfmt, w, h; uint32_t bytes; } pm_att;   // k c / d / s; load 0 clear 1 load 2 don't care; store 0 don't care 1 store; usage 1 read 2 write 4 render target 8 format view 16 atomic; ll: lossless compression still possible
+typedef struct {
+    char kind; uint8_t na, nd, nc, depth, entry_full, after_mfx, nck;
+    uint16_t w, h; uint32_t seg, draws, mesh, copies, ubd, disp, cc[PM_CC_N], ld_kb, st_kb, dom_other, dom_n[PM_DOM], cg[3];
+    uint64_t pass; int end_line; const char *end_fn, *why;
+    pm_att a[PM_ATT]; char dom_vs[PM_DOM][9], dom_fs[PM_DOM][9], ck[3][17];
+} pm_enc;
+typedef struct { pm_enc e[PM_ENC]; int n, trunc; uint64_t frame; int open; _Atomic int busy; } pm_slot;
+static pm_slot g_pm_s[PM_SLOTS]; static id<MTL4CounterHeap> g_pm_heap[PM_SLOTS];
+static long g_pm_f0 = -2, g_pm_f1; static int g_pm_cs = -1, g_pm_take, g_pm_i, g_pm_ebar, g_pm_mfx; static uint64_t g_pm_dec_f = ~0ull, g_pm_skipped;
+static pm_enc *g_pm_cur; static const void *g_pm_e; static FILE *g_pm_file; static pthread_mutex_t g_pm_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t att_bytes(id<MTLTexture> t, NSUInteger level);
+static int pm_on(void) {
+    if (__builtin_expect(g_pm_f0 == -1, 1)) return 0;
+    if (g_pm_f0 == -2) { const char *e = getenv("DM_NVN_PASSMAP"); g_pm_f0 = -1;
+        if (e && *e >= '0' && *e <= '9') { long a = atol(e), n = strchr(e, ',') ? atol(strchr(e, ',') + 1) : 0; if (n < 0) n = 0; g_pm_f0 = a; g_pm_f1 = a + n;
+            MLOG("DM_NVN_PASSMAP: pass map of frames %ld-%ld (diagnostic: each dispatch in a sampled frame gets an encoder of its own unless DM_NVN_PASSMAP_OWN=0)", g_pm_f0, g_pm_f1); } }
+    return g_pm_f0 >= 0;
+}
+static int pm_sampled(void) { long f = (long)atomic_load(&g_cur_frame); return pm_on() && f >= g_pm_f0 && f <= g_pm_f1; }
+static int pm_own(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_PASSMAP_OWN"); v = !(e && !strcmp(e, "0")); } return v && pm_sampled(); }
+static id<MTL4CounterHeap> pm_heap(int s) {
+    if (!g_pm_heap[s]) { MTL4CounterHeapDescriptor *hd = [MTL4CounterHeapDescriptor new]; hd.type = MTL4CounterHeapTypeTimestamp; hd.count = GP_MAX; NSError *er = nil;
+        g_pm_heap[s] = [g_dev newCounterHeapWithDescriptor:hd error:&er];
+        if (!g_pm_heap[s]) { MLOG("[RED] DM_NVN_PASSMAP: no timestamp counter heap: %s", er.description.UTF8String); g_pm_f0 = -1; } }
+    return g_pm_heap[s];
+}
+static void pm_att_fill(pm_att *a, char k, int idx, id<MTLTexture> t, NSUInteger level, MTLLoadAction la, MTLStoreAction sa, uint64_t bytes) {
+    id<MTLTexture> base = t.parentTexture ? t.parentTexture : t; MTLTextureUsage u = base.usage;
+    a->k = k; a->idx = (uint8_t)idx; a->fmt = (uint16_t)t.pixelFormat; a->bfmt = (uint16_t)base.pixelFormat; a->w = (uint16_t)MAX(t.width >> level, 1ul); a->h = (uint16_t)MAX(t.height >> level, 1ul); a->ms = (uint8_t)t.sampleCount;
+    a->load = la == MTLLoadActionClear ? 0 : la == MTLLoadActionLoad ? 1 : 2; a->store = sa != MTLStoreActionDontCare; a->view = t.parentTexture != nil; a->bytes = (uint32_t)MIN(bytes, 0xffffffffull);
+    a->usage = (uint8_t)((u & MTLTextureUsageShaderRead ? 1 : 0) | (u & MTLTextureUsageShaderWrite ? 2 : 0) | (u & MTLTextureUsageRenderTarget ? 4 : 0) | (u & MTLTextureUsagePixelFormatView ? 8 : 0) | (u & 0x20 ? 16 : 0));
+    a->ll = base.allowGPUOptimizedContents && !(a->usage & (2 | 8 | 16));
+}
+static void pm_finish(int s);
+static void pm_begin(id e, char kind, MTL4RenderPassDescriptor *d) {   // right after an encoder of the main command buffer is made (gp_begin)
+    g_pm_cur = NULL; g_pm_e = NULL;
+    if (!pm_on()) return;
+    uint64_t f = atomic_load(&g_cur_frame);
+    if (g_pm_cs >= 0 && g_pm_s[g_pm_cs].open && g_pm_s[g_pm_cs].frame != f) pm_finish(g_pm_cs);   // the sampled frame is over: its report waits for the GPU
+    if (f != g_pm_dec_f) { g_pm_dec_f = f; g_pm_take = 0;   // one decision per frame, at its first encoder, so a frame is recorded whole or not at all
+        if ((long)f >= g_pm_f0 && (long)f <= g_pm_f1) {
+            for (int i = 1; i <= PM_SLOTS && !g_pm_take; i++) { int s = (g_pm_cs + i + PM_SLOTS) % PM_SLOTS; pm_slot *S = &g_pm_s[s];
+                if (S->open || atomic_load(&S->busy) || !pm_heap(s)) continue;
+                S->n = 0; S->trunc = 0; S->frame = f; S->open = 1; g_pm_cs = s; g_pm_take = 1; [g_pm_heap[s] invalidateCounterRange:NSMakeRange(0, GP_MAX)]; }
+            if (!g_pm_take) { g_pm_skipped++; MLOG("[passmap] frame %llu skipped: the reports of the earlier sampled frames are still pending", (unsigned long long)f); } } }
+    if (!g_pm_take || g_pm_cs < 0) return;
+    pm_slot *S = &g_pm_s[g_pm_cs]; if (S->n >= PM_ENC) { S->trunc = 1; return; }
+    pm_enc *p = &S->e[S->n]; memset(p, 0, sizeof *p); id<MTL4CounterHeap> h = g_pm_heap[g_pm_cs]; int k = S->n;
+    p->kind = kind; p->seg = g_seg; p->pass = g_stat_pass; p->after_mfx = (uint8_t)g_pm_mfx; g_pm_mfx = 0;
+    if (kind == 'R') { p->entry_full = (uint8_t)g_pm_ebar; p->draws = (uint32_t)g_stat_draw;
+        if (d) { int na = 0;
+            for (int i = 0; i < 8; i++) { MTLRenderPassColorAttachmentDescriptor *c = d.colorAttachments[i]; if (!c.texture) continue;
+                pm_att_fill(&p->a[na++], 'c', i, c.texture, c.level, c.loadAction, c.storeAction, att_bytes(c.texture, c.level));
+                if (!p->nc++) { p->w = p->a[na - 1].w; p->h = p->a[na - 1].h; } }
+            MTLRenderPassDepthAttachmentDescriptor *z = d.depthAttachment; MTLRenderPassStencilAttachmentDescriptor *sd = d.stencilAttachment; id<MTLTexture> dt = z.texture, stt = sd.texture;
+            if (dt || stt) { uint64_t whole = att_bytes(dt ? dt : stt, dt ? z.level : sd.level); int comb = (dt ? dt : stt).pixelFormat == MTLPixelFormatDepth32Float_Stencil8;
+                uint64_t db = dt ? (comb ? whole / 5 * 4 : whole) : 0, sb = stt && stt != dt ? (comb ? whole / 5 : whole) : stt ? whole - db : 0;
+                if (dt) { pm_att_fill(&p->a[na++], 'd', 0, dt, z.level, z.loadAction, z.storeAction, db); p->depth = 1; if (!p->nc) { p->w = p->a[na - 1].w; p->h = p->a[na - 1].h; } }
+                if (stt) { pm_att_fill(&p->a[na++], 's', 0, stt, sd.level, sd.loadAction, sd.storeAction, sb); if (!dt && !p->nc) { p->w = p->a[na - 1].w; p->h = p->a[na - 1].h; } } }
+            p->na = (uint8_t)na; }
+        [(id<MTL4RenderCommandEncoder>)e writeTimestampWithGranularity:MTL4TimestampGranularityRelaxed afterStage:MTLRenderStageVertex intoHeap:h atIndex:2 * k]; }
+    else { p->copies = g_gp_copies; p->ubd = g_gp_ubd; p->disp = g_gp_disp;
+        [(id<MTL4ComputeCommandEncoder>)e writeTimestampWithGranularity:MTL4TimestampGranularityRelaxed intoHeap:h atIndex:2 * k]; }
+    g_pm_cur = p; g_pm_i = k; g_pm_e = (__bridge const void *)e; S->n++;
+}
+static void pm_end(id e) {   // right before that encoder ends (gp_end)
+    if (!g_pm_cur || (__bridge const void *)e != g_pm_e) return;
+    pm_enc *p = g_pm_cur; int k = g_pm_i; id<MTL4CounterHeap> h = g_pm_heap[g_pm_cs]; g_pm_cur = NULL; g_pm_e = NULL;
+    if (p->kind == 'R') { p->draws = (uint32_t)g_stat_draw - p->draws; p->ld_kb = (uint32_t)((g_bw_load - g_gp_bw_l0) >> 10); p->st_kb = (uint32_t)((g_bw_store - g_gp_bw_s0) >> 10);
+        [(id<MTL4RenderCommandEncoder>)e writeTimestampWithGranularity:MTL4TimestampGranularityRelaxed afterStage:MTLRenderStageFragment intoHeap:h atIndex:2 * k + 1]; }
+    else { p->copies = g_gp_copies - p->copies; p->ubd = g_gp_ubd - p->ubd; p->disp = g_gp_disp - p->disp;
+        [(id<MTL4ComputeCommandEncoder>)e writeTimestampWithGranularity:MTL4TimestampGranularityRelaxed intoHeap:h atIndex:2 * k + 1]; }
+}
+static inline void pm_ender(const char *fn, int line, const char *why) { pm_enc *p = g_pm_cur; if (p && p->kind == 'R') { p->end_fn = fn; p->end_line = line; p->why = why; } }   // rp_end_at: who ends the open pass
+static inline void pm_store(int depth, int idx, int dead) { pm_enc *p = g_pm_cur; if (!p) return; char k = depth == 1 ? 'd' : depth == 2 ? 's' : 'c';   // sd_finish: the store action the pass really gets
+    for (int i = 0; i < p->na; i++) if (p->a[i].k == k && (k != 'c' || p->a[i].idx == idx)) p->a[i].store = !dead; }
+static inline void pm_draw(const char *vs, const char *fs, int mesh) {   // draw: tally of the pass's draws by shader pair
+    pm_enc *p = g_pm_cur; if (!p || p->kind != 'R') return;
+    p->mesh += (uint32_t)(mesh != 0); if (!vs) vs = "-"; if (!fs) fs = "-"; int i = 0;
+    for (; i < p->nd; i++) if (!strncmp(p->dom_vs[i], vs, 8) && !strncmp(p->dom_fs[i], fs, 8)) break;
+    if (i == p->nd) { if (p->nd == PM_DOM) { p->dom_other++; return; } snprintf(p->dom_vs[i], 9, "%.8s", vs); snprintf(p->dom_fs[i], 9, "%.8s", fs); p->nd++; }
+    p->dom_n[i]++;
+}
+static inline void pm_dispatch(const char *key) {   // dispatch: the compute shader(s) of the encoder
+    pm_enc *p = g_pm_cur; if (!p || p->kind != 'C' || !key) return; int i = 0;
+    for (; i < p->nck; i++) if (!strncmp(p->ck[i], key, 16)) break;
+    if (i == p->nck) { if (p->nck == 3) return; snprintf(p->ck[i], 17, "%.16s", key); p->nck++; }
+    p->cg[i]++;
+}
+static inline void pm_copy(void) { pm_enc *p = g_pm_cur; if (p && p->kind == 'C') p->cc[g_pm_cc_why < PM_CC_N ? g_pm_cc_why : 0]++; }   // a copy op of the open copy encoder, by cause (g_pm_cc_why)
+static const char *pm_fmt(unsigned f, char *b, size_t n) {
+    switch (f) { case 0: return "-"; case 10: return "R8Unorm"; case 13: return "R8Uint"; case 20: return "R16Unorm"; case 23: return "R16Uint"; case 25: return "R16Float"; case 30: return "RG8Unorm";
+        case 53: return "R32Uint"; case 55: return "R32Float"; case 60: return "RG16Unorm"; case 63: return "RG16Uint"; case 65: return "RG16Float"; case 70: return "RGBA8Unorm"; case 71: return "RGBA8Unorm_sRGB";
+        case 73: return "RGBA8Uint"; case 80: return "BGRA8Unorm"; case 81: return "BGRA8Unorm_sRGB"; case 90: return "RGB10A2Unorm"; case 92: return "RG11B10Float"; case 105: return "RG32Float";
+        case 113: return "RGBA16Uint"; case 115: return "RGBA16Float"; case 123: return "RGBA32Uint"; case 125: return "RGBA32Float"; case 250: return "Depth16Unorm"; case 252: return "Depth32Float";
+        case 253: return "Stencil8"; case 260: return "Depth32Float_Stencil8"; default: snprintf(b, n, "fmt%u", f); return b; }
+}
+// Why a pass ended: the string the call site set (PM_WHY), else the function that called rp_end. "host:" = the translation layer ended it (the Switch would not have), "jogo:" = the game's own command
+// (a new render target, a clear, a barrier, a copy or dispatch it issued), "outro:" = the call site serves both
+static const char *pm_fn_reason(const char *fn) {
+    static const struct { const char *fn, *r; } t[] = {
+        {"order_draw", "host:ordering-barrier-split"}, {"image_prepare", "host:image-usage-upgrade"}, {"hoist_try", "host:clear-hoist"}, {"fz_check_run", "host:tile-merge-check"}, {"defer_fallback", "host:deferred-merge-fallback"},
+        {"fb_depth_rule", "host:depth-read-after-write"}, {"fb_prepare", "host:feedback-split"}, {"ixc_run", "host:indirect-conversion"}, {"wide_run", "host:index8-expansion"}, {"mdi_wait", "host:multidraw-wait"},
+        {"mdx_run", "host:multidraw-mask"}, {"lc_land", "host:clear-landing"}, {"ubd_land", "host:uniform-update-land"}, {"rp_begin", "host:render-area"}, {"up_mfx_encode", "host:upscaler"}, {"dlss_eval", "host:upscaler"},
+        {"td_dump", "host:diagnostic"}, {"blit_raw", "outro:copy-or-update"}, {"draw_", "host:draw-split"}, {"mtl_exec", "jogo:command"}, {"dispatch", "jogo:dispatch"}, {"copy_t2t", "jogo:copy"}, {"copy_t2t_draw", "jogo:copy"},
+        {"draw_tex", "jogo:copy"}, {"clear_tex", "jogo:clear"}, {"clear_tex_tri", "jogo:clear"}, {"clear_color_tri", "host:clear-reopen"}, {"clear_ds_tri", "host:clear-reopen"}, {"rp_flush", "outro:flush"} };
+    for (size_t i = 0; i < sizeof t / sizeof *t; i++) if (!strcmp(fn, t[i].fn)) return t[i].r;
+    return "outro:?";
+}
+enum { PC_PRE, PC_SOM, PC_CENA, PC_POS, PC_NDSR, PC_HCOPY, PC_GCOPY, PC_COMP, PC_N };
+static const char *const pm_cat_name[PC_N] = {"prepass", "sombras", "cena", "pos", "NDSR", "copias-host", "copias-jogo", "compute"};
+static int pm_is_ndsr(const pm_enc *p) {
+    static const char *keys; if (!keys) { keys = getenv("DM_NVN_PASSMAP_NDSR"); if (!keys) keys = "fa3033d05c0a41d6"; }
+    for (int i = 0; i < p->nck; i++) for (const char *q = keys; *q; q = strchr(q, ',') ? strchr(q, ',') + 1 : q + strlen(q)) { size_t n = strcspn(q, ","); if (n && !strncmp(p->ck[i], q, n)) return 1; }
+    return 0;
+}
+static FILE *pm_open(void) {
+    if (g_pm_file) return g_pm_file;
+    const char *o = getenv("DM_NVN_PASSMAP_OUT"), *r = getenv("DM_ROOT"); char path[1024];
+    if (o && *o) snprintf(path, sizeof path, "%s", o); else snprintf(path, sizeof path, "%s/passmap.tsv", r && *r ? r : ".");
+    g_pm_file = fopen(path, "w"); if (!g_pm_file) { MLOG("[RED] DM_NVN_PASSMAP cannot open %s", path); return NULL; }
+    fprintf(g_pm_file, "frame\tidx\tkind\tcategory\tus\tstart_us\tgap_us\tseg\tcb_split\tpass\tsize\tcolors\tdepth\tdraws\tmesh_draws\tdominant_vs/fs:draws\tbreak_by\tend_site\tentry_barrier\tload_bytes\tstore_bytes\t"
+                         "ledger_load_kb\tledger_store_kb\tattachments(k:fmt:WxH:load:store:usage:view:ll:KB)\tno_lossless_att\tcopies\tcopy_causes\tdispatches\tcompute_shaders\tafter_mfx\n");
+    MLOG("DM_NVN_PASSMAP: writing %s", path); return g_pm_file;
+}
+static void pm_report(int s) {   // the sampled frame's last command buffer has completed
+    pm_slot *S = &g_pm_s[s]; int n = S->n; id<MTL4CounterHeap> h = g_pm_heap[s]; uint64_t frame = S->frame;
+    NSData *r = n ? [h resolveCounterRange:NSMakeRange(0, (NSUInteger)(2 * n))] : nil; const uint64_t *t = r.bytes;
+    if (!t) { MLOG("[RED] DM_NVN_PASSMAP: frame %llu: no timestamps (%d encoders)", (unsigned long long)frame, n); atomic_store(&S->busy, 0); return; }
+    double tick = 1e9 / (double)[g_dev queryTimestampFrequency];
+    // the scene size: the colour + depth pass with the most draws (or DM_NVN_PASSMAP_SCENE=WxH)
+    unsigned sw = 0, sh = 0; uint32_t best = 0; const char *se = getenv("DM_NVN_PASSMAP_SCENE"); if (se) sscanf(se, "%ux%u", &sw, &sh);
+    if (!sw) for (int i = 0; i < n; i++) { const pm_enc *p = &S->e[i]; if (p->kind == 'R' && p->nc && p->depth && p->draws >= best) { best = p->draws; sw = p->w; sh = p->h; } }
+    if (!sw) for (int i = 0; i < n; i++) { const pm_enc *p = &S->e[i]; if (p->kind == 'R' && p->nc && p->draws >= best) { best = p->draws; sw = p->w; sh = p->h; } }
+    struct { double us; uint32_t n, draws, mesh; uint64_t ld, st; } cat[PC_N]; memset(cat, 0, sizeof cat);
+    struct { const char *r; uint32_t n; } why[24]; memset(why, 0, sizeof why); int nwhy = 0; uint32_t host_brk = 0, game_brk = 0, other_brk = 0, nr = 0, nc_enc = 0, full = 0, skip = 0, cuts = 0, nl_att = 0, n_att = 0, mfx_n = 0;
+    uint32_t cc[PM_CC_N] = {0}; double sum_r = 0, sum_c = 0, gap_sum = 0, mfx_us = 0; uint64_t t0 = 0, t1 = 0, ld_tot = 0, st_tot = 0, prev_end = 0; uint32_t prev_seg = 0;
+    pthread_mutex_lock(&g_pm_mu); FILE *f = pm_open();
+    for (int i = 0; i < n && f; i++) {
+        const pm_enc *p = &S->e[i]; uint64_t a = t[2 * i], b = t[2 * i + 1]; if (!a || !b || b < a) continue;
+        double us = (double)(b - a) * tick / 1e3; if (!t0 || a < t0) t0 = a; if (b > t1) t1 = b;
+        double start = (double)(a - t0) * tick / 1e3, gap = prev_end && a > prev_end ? (double)(a - prev_end) * tick / 1e3 : 0; prev_end = b;
+        int cut = p->seg != prev_seg && p->seg > 0; prev_seg = p->seg; cuts += cut; gap_sum += gap;
+        uint64_t ldb = 0, stb = 0; char att[1400], fb[24], fb2[24]; att[0] = 0; size_t al = 0; uint32_t nlr = 0;
+        for (int k = 0; k < p->na; k++) { const pm_att *x = &p->a[k]; char us_[8]; int m = 0;
+            if (x->usage & 1) us_[m++] = 'R'; if (x->usage & 2) us_[m++] = 'W'; if (x->usage & 4) us_[m++] = 'T'; if (x->usage & 8) us_[m++] = 'V'; if (x->usage & 16) us_[m++] = 'A'; us_[m] = 0;
+            if (x->load == 1) ldb += x->bytes; if (x->store) stb += x->bytes; n_att++; if (!x->ll) { nl_att++; nlr++; }
+            al += (size_t)snprintf(att + al, sizeof att - al, "%s%c%d:%s%s%s:%ux%u:%s:%s:%s:v%d:ll%d:%u", k ? ";" : "", x->k, x->idx, pm_fmt(x->fmt, fb, sizeof fb), x->bfmt != x->fmt ? "/" : "", x->bfmt != x->fmt ? pm_fmt(x->bfmt, fb2, sizeof fb2) : "",
+                                   x->w, x->h, x->load == 0 ? "clear" : x->load == 1 ? "load" : "dc", x->store ? "store" : "dc", us_, x->view, x->ll, x->bytes >> 10); if (al >= sizeof att) al = sizeof att - 1; }
+        int c = PC_COMP; const char *brk = "-";
+        if (p->kind == 'R') { nr++; sum_r += us; ld_tot += ldb; st_tot += stb; full += p->entry_full; skip += !p->entry_full;
+            c = p->nc ? (p->depth && p->w == sw && p->h == sh ? PC_CENA : PC_POS) : (p->w == sw && p->h == sh ? PC_PRE : PC_SOM);
+            brk = p->why ? p->why : p->end_fn ? pm_fn_reason(p->end_fn) : "outro:?";
+            if (!strncmp(brk, "host", 4)) host_brk++; else if (!strncmp(brk, "jogo", 4)) game_brk++; else other_brk++;
+            int j = 0; for (; j < nwhy; j++) if (!strcmp(why[j].r, brk)) break; if (j == nwhy && nwhy < 24) why[nwhy++].r = brk; if (j < 24) why[j].n++; }
+        else { nc_enc++; sum_c += us; for (int k = 0; k < PM_CC_N; k++) cc[k] += p->cc[k];
+            c = pm_is_ndsr(p) ? PC_NDSR : p->disp ? PC_COMP : p->cc[1] + p->cc[2] + p->cc[3] ? PC_HCOPY : PC_GCOPY; }
+        cat[c].us += us; cat[c].n++; cat[c].draws += p->draws; cat[c].mesh += p->mesh; cat[c].ld += ldb; cat[c].st += stb;
+        if (p->after_mfx) { mfx_n++; mfx_us += gap; }
+        char dom[256]; size_t dl = 0; dom[0] = 0;
+        for (int k = 0; k < p->nd; k++) dl += (size_t)snprintf(dom + dl, sizeof dom - dl, "%s%s/%s:%u", k ? ";" : "", p->dom_vs[k], p->dom_fs[k], p->dom_n[k]); if (p->dom_other) dl += (size_t)snprintf(dom + dl, sizeof dom - dl, ";other:%u", p->dom_other); if (dl >= sizeof dom) dom[sizeof dom - 1] = 0;
+        char ck[80]; size_t kl = 0; ck[0] = 0; for (int k = 0; k < p->nck; k++) kl += (size_t)snprintf(ck + kl, sizeof ck - kl, "%s%s:%u", k ? ";" : "", p->ck[k], p->cg[k]); if (kl >= sizeof ck) ck[sizeof ck - 1] = 0;
+        if (p->kind == 'R') fprintf(f, "%llu\t%d\tR\t%s\t%.1f\t%.1f\t%.1f\t%u\t%d\t%llu\t%ux%u\t%u\t%u\t%u\t%u\t%s\t%s\t%s:%d\t%s\t%llu\t%llu\t%u\t%u\t%s\t%u\t-\t-\t-\t-\t%u\n", (unsigned long long)frame, i, pm_cat_name[c], us, start, gap, p->seg, cut,
+                                    (unsigned long long)p->pass, p->w, p->h, p->nc, p->depth, p->draws, p->mesh, dom[0] ? dom : "-", brk, p->end_fn ? p->end_fn : "-", p->end_line, p->entry_full ? "full" : "skipped",
+                                    (unsigned long long)ldb, (unsigned long long)stb, p->ld_kb, p->st_kb, att, nlr, p->after_mfx);
+        else fprintf(f, "%llu\t%d\tC\t%s\t%.1f\t%.1f\t%.1f\t%u\t%d\t%llu\t-\t-\t-\t-\t-\t-\t-\t-\t-\t0\t0\t-\t-\t-\t-\t%u\tother:%u,fb:%u,depth:%u,ubd:%u\t%u\t%s\t%u\n", (unsigned long long)frame, i, pm_cat_name[c], us, start, gap, p->seg, cut,
+                     (unsigned long long)p->pass, p->copies, p->cc[0], p->cc[1], p->cc[2], p->cc[3], p->disp, ck[0] ? ck : "-", p->after_mfx);
+    }
+    if (f) {
+        double span = (double)(t1 - t0) * tick / 1e3;
+        fprintf(f, "# frame %llu: %d encoders (%u render passes, %u copy / compute encoders%s), sum of encoder times %.2f ms (render %.2f, copy / compute %.2f), first start to last end %.2f ms, idle gaps between encoders %.2f ms; scene size %ux%u\n",
+                (unsigned long long)frame, n, nr, nc_enc, S->trunc ? ", TRUNCATED at 2048" : "", (sum_r + sum_c) / 1e3, sum_r / 1e3, sum_c / 1e3, span / 1e3, gap_sum / 1e3, sw, sh);
+        fprintf(f, "# category\tencoders\tms\tload_MB\tstore_MB\tdraws\tmesh_draws\n");
+        for (int c = 0; c < PC_N; c++) fprintf(f, "# %s\t%u\t%.2f\t%.1f\t%.1f\t%u\t%u\n", pm_cat_name[c], cat[c].n, cat[c].us / 1e3, cat[c].ld / 1048576.0, cat[c].st / 1048576.0, cat[c].draws, cat[c].mesh);
+        fprintf(f, "# passes %u, attachment load %.1f MB, store %.1f MB (the bytes of the attachments; the ledger columns count them as the host's bandwidth ledger does)\n", nr, ld_tot / 1048576.0, st_tot / 1048576.0);
+        fprintf(f, "# host copies: feedback snapshot %u, depth copy %u, uniform update %u (other copy ops %u); pass breaks by the host %u, by the game %u, unclassified %u\n", cc[1], cc[2], cc[3], cc[0], host_brk, game_brk, other_brk);
+        fprintf(f, "# break reasons:"); for (int j = 0; j < nwhy; j++) fprintf(f, " %s=%u", why[j].r, why[j].n); fprintf(f, "\n");
+        fprintf(f, "# split submits (command buffer cuts inside the frame) %u; draw-pass entry barriers: full %u, skipped %u; attachments without lossless compression %u of %u\n", cuts, full, skip, nl_att, n_att);
+        fprintf(f, "# MetalFX scaler runs after %u encoders: the idle gap before them, %.2f ms, is its time (the scaler is not an encoder of this map)\n", mfx_n, mfx_us / 1e3);
+        fflush(f);
+        MLOG("[passmap] frame %llu: %d encoders, %.2f ms summed, span %.2f ms, %u host copies, %u host / %u game pass breaks", (unsigned long long)frame, n, (sum_r + sum_c) / 1e3, span / 1e3, cc[1] + cc[2] + cc[3], host_brk, game_brk);
+    }
+    pthread_mutex_unlock(&g_pm_mu); atomic_store(&S->busy, 0);
+}
+static void pm_finish(int s) {   // the frame's last encoder has been made; the report comes when the GPU has run the frame's last submission (g_fence covers all its submissions)
+    pm_slot *S = &g_pm_s[s]; S->open = 0; atomic_store(&S->busy, 1);
+    static MTLSharedEventListener *listener; if (!listener) listener = [MTLSharedEventListener new];
+    [g_ev notifyListener:listener atValue:g_fence block:^(id<MTLSharedEvent> event, uint64_t value) { (void)event; (void)value; pm_report(s); }];
+}
 static int gp_active(void) {
     if (__builtin_expect(g_gp_f0 == -1, 1)) return 0;
     if (g_gp_f0 == -2) { const char *e = getenv("DM_NVN_GPUPROF");
@@ -1672,6 +1873,7 @@ static void gp_periodic_finish(void) {   // on the submit thread, before the nex
 }
 static id<MTL4CounterHeap> g_ts_heap; static int g_ts_pend = -1;   // ts_on; pend: the boundary the next encoder writes (ts_stamp)
 static void gp_begin(id e, char kind, MTL4RenderPassDescriptor *d) {   // right after an encoder of the main command buffer is made
+    pm_begin(e, kind, d);   // DM_NVN_PASSMAP
     if (g_ts_pend >= 0) { NSUInteger slot = (NSUInteger)g_ts_pend; g_ts_pend = -1;
         if (kind == 'R') [(id<MTL4RenderCommandEncoder>)e writeTimestampWithGranularity:MTL4TimestampGranularityRelaxed afterStage:MTLRenderStageVertex intoHeap:g_ts_heap atIndex:slot];
         else [(id<MTL4ComputeCommandEncoder>)e writeTimestampWithGranularity:MTL4TimestampGranularityRelaxed intoHeap:g_ts_heap atIndex:slot]; }
@@ -1694,6 +1896,7 @@ static void gp_begin(id e, char kind, MTL4RenderPassDescriptor *d) {   // right 
     g_gp_n++;
 }
 static void gp_end(id e) {   // right before that encoder ends
+    pm_end(e);   // DM_NVN_PASSMAP
     if (g_gp_cur < 0 || (__bridge const void *)e != g_gp_e) return;   // another queue's encoder: the open pass keeps its label and gets its end stamp from its own end
     int k = g_gp_cur; g_gp_cur = -1; g_gp_e = NULL;
     if (g_gp_lab[k].kind == 'R') { g_gp_lab[k].ld_kb = (uint32_t)((g_bw_load - g_gp_bw_l0) >> 10); g_gp_lab[k].st_kb = (uint32_t)((g_bw_store - g_gp_bw_s0) >> 10); }   // since the previous pass end (rp_end); sd_finish has set the stores
@@ -1717,9 +1920,9 @@ static void gp_report(int n, gp_lab *lab, uint64_t frame) {   // the frame's las
 static void tf_pass_end(void); static id<MTL4RenderCommandEncoder> g_tf_enc;   // the open transform feedback capture pass (nvn_feedback.inc): ended before any other encoder begins
 static inline id<MTL4RenderCommandEncoder> enc_r_begin_pass(MTL4RenderPassDescriptor *d) { if (g_tf_enc) tf_pass_end(); g_cm_enc++; cm_enc_mark(2);   // the draw passes (rp_begin_ex); see barrier_game
     id<MTL4RenderCommandEncoder> e = [g_cb renderCommandEncoderWithDescriptor:d]; cm_enc_mark(0);
-    if (g_last_end_relaxed && !(g_game_barrier & GAME_BARRIER_FULL) && barrier_game()) { g_bar_skip++;   // ordered by the relaxed end barrier; the alias flush, when aliases exist, is a consumer barrier before this pass's fragments (see m4_end)
+    if (g_last_end_relaxed && !(g_game_barrier & GAME_BARRIER_FULL) && barrier_game()) { g_bar_skip++; g_pm_ebar = 0;   // ordered by the relaxed end barrier; the alias flush, when aliases exist, is a consumer barrier before this pass's fragments (see m4_end)
         MTL4VisibilityOptions vis = resource_vis(); if (vis & MTL4VisibilityOptionResourceAlias) [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageFragment visibilityOptions:vis]; }
-    else { [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:resource_vis()]; g_bar_full++; }
+    else { [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:resource_vis()]; g_bar_full++; g_pm_ebar = 1; }
     g_game_barrier = 0;
     [e setArgumentTable:g_vt atStages:MTLRenderStageVertex]; [e setArgumentTable:g_ft atStages:MTLRenderStageFragment]; gp_begin(e, 'R', d); return e;
 }
@@ -1797,7 +2000,7 @@ static id<MTL4ComputeCommandEncoder> blit_open(void) { if (g_tf_enc) tf_pass_end
 static void ubd_flush(void); static int g_nubd;   // the inline updates deferred (see mtl_sub_update)
 static int g_ubd_landing;
 static id<MTL4ComputeCommandEncoder> blit_raw(void) {
-    blit_note(); if (enc_open()) g_blit_splits++; rp_end(); id<MTL4ComputeCommandEncoder> e = blit_open();
+    blit_note(); if (enc_open()) g_blit_splits++; if (g_pm_cc_why == 1) PM_WHY("host:feedback-snapshot-copy"); else if (g_pm_cc_why == 2) PM_WHY("host:depth-copy"); else if (g_pm_cc_why == 3) PM_WHY("host:uniform-update-copy"); rp_end(); id<MTL4ComputeCommandEncoder> e = blit_open();
     if (g_nubd && !g_ubd_landing) { g_ubd_landing = 1; ubd_flush(); g_ubd_landing = 0; }   // deferred inline updates come before this copy or dispatch in command order
     return e;
 }
@@ -1842,7 +2045,7 @@ int nvn_sparse_alias(uint64_t lo, uint64_t hi);   // hle_nvn.c: a sparse guest r
 static id<MTL4ComputeCommandEncoder> blit_buf(uint64_t rlo, uint64_t rhi, uint64_t wlo, uint64_t whi) {
     g_wr_epoch++;
     g_blit_alias = 1;   // before blit_raw, so an encoder it opens starts with alias visibility
-    id<MTL4ComputeCommandEncoder> e = blit_raw();
+    id<MTL4ComputeCommandEncoder> e = blit_raw(); pm_copy();
     g_blit_alias = 1;   // again: blit_raw may have ended an encoder in between
     // Sparse mappings can join unrelated physical runs, so conservatively order
     // their operations with everything before and after. Ordinary pools keep the
@@ -1855,7 +2058,7 @@ static id<MTL4ComputeCommandEncoder> blit_buf(uint64_t rlo, uint64_t rhi, uint64
 }
 // texture copies / readbacks: barrier if anything came before, and later operations must wait for it too
 static id<MTL4ComputeCommandEncoder> blit(void) {
-    id<MTL4ComputeCommandEncoder> e = blit_raw();
+    id<MTL4ComputeCommandEncoder> e = blit_raw(); pm_copy();
     if (g_blit_ops) blit_barrier();
     g_bw_lo[0] = 0; g_bw_hi[0] = ~0ull; g_bw_n = 1; g_br_n = 0; g_blit_ops = 1;   // record as "everything written": the next operation always gets a barrier
     return e;
@@ -1984,7 +2187,7 @@ static void ubd_flush(void) {
     ubd_bm_clear(); int n = g_nubd; g_nubd = 0; g_ubd_ver++; memset(g_ubd_pf, 0, sizeof g_ubd_pf); g_ubd_wide = 0; g_ubd_env_lo = UINT64_MAX; g_ubd_env_hi = 0;
     for (int i = 0; i < n; i++) { const ubd_ent *e = &g_ubd[i]; void *db; uint64_t dof;
         if (!mtl_addr(e->lo, e->hi - e->lo, &db, &dof)) continue;
-        enc_b_copy_buffer(blit_buf(0, 0, e->lo, e->hi), e->buf, e->off, (__bridge id<MTLBuffer>)db, dof, e->hi - e->lo); g_gp_ubd++; }
+        g_pm_cc_why = 3; enc_b_copy_buffer(blit_buf(0, 0, e->lo, e->hi), e->buf, e->off, (__bridge id<MTLBuffer>)db, dof, e->hi - e->lo); g_pm_cc_why = 0; g_gp_ubd++; }
 }
 // The bytes [lo, lo+n) as the deferred updates leave them (ubd_covers holds): for bindless handles read from uniform memory (ubo_handle)
 static void ubd_read(uint64_t lo, size_t n, void *out) {
@@ -2540,7 +2743,7 @@ uint64_t mtl_sub_commit(void) {
     if (g_tf_enc) tf_pass_end();   // the capture pass and the saves it holds (nvn_feedback.inc), before this submission's writes are counted
     lc_land();   // clears still waiting (the command list ends with them)
     defer_fallback();   // Deferred merged pass: at the end of the submission there are still P draws not replayed (the normal path never gets here)
-    rp_flush(); ubd_land();
+    PM_WHY("jogo:end-of-submission"); rp_flush(); ubd_land();
     g_ts_pend = -1;   // nothing after it: the last segment's end is the command buffer's own (rep_ticks)
     if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
     up_flush();
@@ -5632,7 +5835,7 @@ static void rt_mirror_flush(void) {
     }
     if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
 }
-static void rp_end_at(const char *fn, int line) { if (g_enc) { AP_B; geo_mesh_flush_pass(); PD("E %llu pass ends in %s:%d", g_stat_pass, fn, line);
+static void rp_end_at(const char *fn, int line) { const char *pm_w = g_pm_why; g_pm_why = NULL; if (g_enc) { AP_B; pm_ender(fn, line, pm_w); geo_mesh_flush_pass(); PD("E %llu pass ends in %s:%d", g_stat_pass, fn, line);
     if (enc_label_on()) { static uint64_t lf = ~0ull, base; uint64_t f = atomic_load(&g_cur_frame); if (f != lf) { lf = f; base = g_stat_pass - 1; }   // Intra-frame serial: the same pass has the same name every frame, so the table can aggregate by name
         [(id)g_enc setLabel:[NSString stringWithFormat:@"p%02llu %dx%d %s d%d", (unsigned long long)(g_stat_pass - base), g_el_w, g_el_h, g_el_key[0] ? g_el_key : "-", g_el_draws]]; }
 #ifdef NVN_RT_RANGE_TEST
@@ -12551,6 +12754,7 @@ static void sd_finish(void) {
         int img_dead = t->depth == 0 && t->load && t->img && !t->rast;
         int dead = t->state == 2 || udc_dead || xvdead || img_dead; MTLStoreAction sa = dead ? MTLStoreActionDontCare : MTLStoreActionStore;
         if (xvdead) { xv_set(t->ser, t->lv, t->sl, XV_INVALID, xtag); g_xv_dc++; }
+        pm_store(t->depth, t->idx, dead);
         if (t->depth == 1) [g_enc setDepthStoreAction:sa]; else if (t->depth == 2) [g_enc setStencilStoreAction:sa]; else [g_enc setColorStoreAction:sa atIndex:(NSUInteger)t->idx];
         g_sd_n_all++; if (dead) { g_sd_n_dead++; g_sd_dead_bytes += t->bytes; g_bw_store -= t->bytes; if (udc_dead) g_udc_saved_bytes += t->bytes; }
         if (!t->state) t->why = 5;
@@ -14271,8 +14475,8 @@ static int fb_depth_snap(NvShader *fs, const nvn_rbind *b, int tid, uint64_t ser
     if (!use) { e->ser = 0; RED_ONCE(163, "same-pass depth sampling: cannot create the snapshot view (format %lu); left as is", (unsigned long)t.pixelFormat); return 0; }
     if (fresh) {
         if (g_enc) g_fb_split++;
-        rp_flush();   // the same for a clear still waiting (see fb_snap)
-        enc_b_copy_texture(blit(), base, (NSUInteger)sl, (NSUInteger)lv, MTLOriginMake(0, 0, 0), MTLSizeMake(w, h, 1), e->snap, 0, 0, MTLOriginMake(0, 0, 0));
+        PM_WHY("host:depth-copy"); rp_flush();   // the same for a clear still waiting (see fb_snap)
+        g_pm_cc_why = 2; enc_b_copy_texture(blit(), base, (NSUInteger)sl, (NSUInteger)lv, MTLOriginMake(0, 0, 0), MTLSizeMake(w, h, 1), e->snap, 0, 0, MTLOriginMake(0, 0, 0)); g_pm_cc_why = 0;
         fb_pass_sync();
     } else g_fb_dsnap_reuse++;
     if (g_fb_use[g_fb_n] && g_fb_use[g_fb_n] != use) defer_obj_unref(g_fb_use[g_fb_n]);
@@ -14300,7 +14504,7 @@ static void fb_depth_rule(NvShader *fs, int dsw) {
     if (!ns && !other) return;
     if (!fb_depth_on()) { g_fb_dread = 1; return; }
     if (!dsw) {
-        if (g_enc && g_fb_dwrote) { g_fb_split++; g_fb_dsplit++; rp_end(); fb_pass_sync();
+        if (g_enc && g_fb_dwrote) { g_fb_split++; g_fb_dsplit++; PM_WHY("host:depth-sampled-after-write"); rp_end(); fb_pass_sync();
             if (g_fb_dsplit == 1 || g_fb_dsplit == 1000 || g_fb_dsplit % 100000 == 0)
                 MLOG("same-pass depth sampling: pass end #%llu, shader %s samples the depth attachment ser=%llu an earlier draw of its pass wrote (frame %llu pass %llu)", (unsigned long long)g_fb_dsplit, fs->key,
                      (unsigned long long)dser, (unsigned long long)atomic_load(&g_cur_frame), g_stat_pass);
@@ -14318,10 +14522,10 @@ static void fb_prepare(NvProg *pr) {
     fb_pass_sync();
     uint32_t wm = 0;   // the attachments this draw writes
     for (int k = 0; k < R.rt.n && k < 8; k++) if (R.rt.color[k] && ((S.chmask.mask >> (4 * k)) & 0xf) && (fs->rf.color_known ? fs->rf.color_mask >> k & 1 : 1)) wm |= 1u << k;
-    if (g_enc && (wm & g_fb_rmask)) { g_fb_split++; rp_end(); fb_pass_sync(); }   // an earlier draw of this pass read an attachment this one writes: it must not see these writes
+    if (g_enc && (wm & g_fb_rmask)) { g_fb_split++; PM_WHY("host:feedback-read-then-write"); rp_end(); fb_pass_sync(); }   // an earlier draw of this pass read an attachment this one writes: it must not see these writes
     int dsw = R.rt.depth && ((S.ds.dt && S.ds.dw) || (S.ds.st && (S.st_wmask[0] || S.st_wmask[1]) && (S.ds.fail_f != NVN_STENCIL_OP_KEEP || S.ds.zfail_f != NVN_STENCIL_OP_KEEP || S.ds.zpass_f != NVN_STENCIL_OP_KEEP
         || S.ds.fail_b != NVN_STENCIL_OP_KEEP || S.ds.zfail_b != NVN_STENCIL_OP_KEEP || S.ds.zpass_b != NVN_STENCIL_OP_KEEP)));
-    if (g_enc && dsw && g_fb_dread) { g_fb_split++; g_fb_split_pool += g_fb_dread_pool; g_fb_dread_pool = 0; rp_end(); fb_pass_sync(); }   // the same for its depth and stencil (see rtc_on)
+    if (g_enc && dsw && g_fb_dread) { g_fb_split++; g_fb_split_pool += g_fb_dread_pool; g_fb_dread_pool = 0; PM_WHY("host:depth-read-then-write"); rp_end(); fb_pass_sync(); }   // the same for its depth and stencil (see rtc_on)
     if (R.rt.depth) fb_depth_rule(fs, dsw);
     if (R.rt.n && R.rt.depth && !g_fb_dread && ((fs->rf.pool && pool_ds_read(R.rt.depth) && (g_fb_dread_pool = 1)) || fs->rf.dyn)) g_fb_dread = 1;   // may read it: pool and dynamic tables, in colour passes as before
     uint64_t tile[4]; int ntile = fb_tile_plan(pr, wm, tile);
@@ -14388,9 +14592,9 @@ static void fb_prepare(NvProg *pr) {
             fb_cache_t *e = fb_snap(ser, lv, sl, base.pixelFormat, w, h, g_fb_mode == 2, &fresh); if (!e) continue;
             id<MTLTexture> snap = e->snap;
             if (fresh) {
-                rp_flush();   // ends the pass, or lands a clear still waiting to be its load action: the snapshot holds the cleared content (fb_snap)
-                id<MTL4ComputeCommandEncoder> be = blit(); enc_b_copy_texture(be, base, (NSUInteger)sl, (NSUInteger)lv, MTLOriginMake(0, 0, 0), MTLSizeMake(w, h, 1), snap, 0, 0, MTLOriginMake(0, 0, 0));
-            } else if (g_enc && (g_fb_rmask >> k & 1)) rp_end();   // an earlier draw of this pass read the attachment directly: it must not see this pass's writes
+                PM_WHY("host:feedback-snapshot-copy"); rp_flush();   // ends the pass, or lands a clear still waiting to be its load action: the snapshot holds the cleared content (fb_snap)
+                g_pm_cc_why = 1; id<MTL4ComputeCommandEncoder> be = blit(); enc_b_copy_texture(be, base, (NSUInteger)sl, (NSUInteger)lv, MTLOriginMake(0, 0, 0), MTLSizeMake(w, h, 1), snap, 0, 0, MTLOriginMake(0, 0, 0)); g_pm_cc_why = 0;
+            } else if (g_enc && (g_fb_rmask >> k & 1)) { PM_WHY("host:feedback-read-then-write"); rp_end(); }   // an earlier draw of this pass read the attachment directly: it must not see this pass's writes
             if (!g_enc) fb_pass_sync();
             MTLTextureSwizzleChannels sw = t.swizzle;
             int same = t.pixelFormat == snap.pixelFormat && sw.red == MTLTextureSwizzleRed && sw.green == MTLTextureSwizzleGreen && sw.blue == MTLTextureSwizzleBlue && sw.alpha == MTLTextureSwizzleAlpha;
@@ -15055,7 +15259,7 @@ static void draw_(const p_draw *dw, const p_draw_idx *di) {
         }
     }
     if (!g_geo_mesh.on) geo_mesh_flush_draw();   // another draw (a geometry draw decides in geo_mesh_draw): a waiting run of mesh draws goes first
-    if (g_enc && g_enc_geo_nocolor != g_geo_omit_colors) rp_end();
+    if (g_enc && g_enc_geo_nocolor != g_geo_omit_colors) { PM_WHY("host:geometry-pass"); rp_end(); }
     if (g_enc && !g_geo_program && !g_geo_mesh.on) pass_split_try();
     int mdx_on = (dw && dw->mdi_cnt) || (di && di->mdi_cnt) ? mdx_wanted(dw, di) : 0;   // an indirect-count multi-draw's record masked on the GPU (mdx_run), else read after a wait
     if (!mdx_on && ((di && di->mdi_cnt && !mdi_live(di->mdi_cnt, di->mdi_i)) || (dw && dw->mdi_cnt && !mdi_live(dw->mdi_cnt, dw->mdi_i)))) return;   // past the multi-draw's count
@@ -15071,7 +15275,7 @@ static void draw_(const p_draw *dw, const p_draw_idx *di) {
     // Rasterizer discard suppresses fragments, not vertex execution or its storage and image writes (the build gives such a vertex shader main0_discard).
     // Xenoblade Chronicles 3 uses vertex-only work before its skinned-model draws; Metroid Prime Remastered fills its fog volume with image stores from points.
     if (S.rast_discard && (!pr->sh[0] || !pr->sh[0]->discard_fn)) { PD("Z %llu draw skipped: rasterizer discard with no vertex storage or image writes vs=%s", g_stat_pass + !g_enc, pr->sh[0] ? pr->sh[0]->key : "-"); return; }
-    if (g_nubd && (g_enc || ubd_lazy()) && ubd_conflict(pr, dw, di)) { g_ubd_conflicts++; rp_end(); ubd_land(); }   // land the deferred inline updates before this draw (see ubd_conflict)
+    if (g_nubd && (g_enc || ubd_lazy()) && ubd_conflict(pr, dw, di)) { g_ubd_conflicts++; PM_WHY("host:uniform-update-conflict"); rp_end(); ubd_land(); }   // land the deferred inline updates before this draw (see ubd_conflict)
     vertex_dump(pr->sh[0], dw, di);
     if (zskip_can_draw(pr)) {   // Zero-source skip: the output is always 0, writing 0 over 0, so this draw changes no result (see zskip_can_draw)
         g_zskip_count++; { static int once; if (!once++) MLOG("zero-source skip: first case pass %llu", g_stat_pass + 1); }
@@ -15100,19 +15304,19 @@ static void draw_(const p_draw *dw, const p_draw_idx *di) {
     // The continued render pass may have been opened with fewer depth / stencil attachments (open modes 2 / 3 / 4): if the plane this draw needs is not attached, split before it (on reopen, attach per the new lookahead)
     if (g_rt_merged && g_enc_mode != 0 && (((S.ds.dt || S.ds.dw) && !g_pass.hd) || (S.ds.st && !g_pass.hs))) {
         static int once2; if (!once2++) MLOG("same-target continuation: a draw in the continued pass needs a depth / stencil plane that is not attached; split here (first case pass %llu)", g_stat_pass);
-        PD("M %llu a draw in the continued pass needs a depth / stencil plane that is not attached; split here", g_stat_pass); rp_end(); }
+        PD("M %llu a draw in the continued pass needs a depth / stencil plane that is not attached; split here", g_stat_pass); PM_WHY("host:continued-pass-needs-depth"); rp_end(); }
     if (g_rt_range_active && (!rt_range_pr_ro(pr) || !S.ds.dt || S.ds.dw || S.ds.st)) rp_end();   // The external write visibility at the original encoder boundary is not removed
     g_samples_fb_left = !tbdr_on();
     int rt_sampled = g_rt_merged && draw_samples_rt(pr); g_samples_fb_left = 0;
     if (rt_sampled) { static int once; if (!once++) MLOG("same-target continuation: a draw in the continued pass samples an attachment; split here (first case pass %llu)", g_stat_pass);
-        PD("M %llu a draw in the continued pass samples an attachment; split here", g_stat_pass); rp_end(); }
+        PD("M %llu a draw in the continued pass samples an attachment; split here", g_stat_pass); PM_WHY("host:continued-pass-samples-attachment"); rp_end(); }
     order_draw(pr, g_fz.active || g_sm_pass || g_defer_replaying);   // a write after an ordering barrier in the pass
     static id<MTLFunction> fz_fn;   // Specialized fragment function for this draw of the later pass in a merged render pass (nil = use the original version)
     if (g_fz.active && g_enc && g_fz.phase == 2 && (lop_on() || !fz_p2_draw(pr, dw, di, g_fz.lmap2, &fz_fn))) {   // Cannot be proven (or a logic operation, which needs the shader's own targets: lop_key): end the merged render pass (the earlier pass's result is stored as usual) and reopen with the later pass's original targets
         static int once3; if (!once3++) MLOG("readable-tile pass merge: a draw of the later pass is not provable; back to separate passes (first case pass %llu)", g_stat_pass);
-        g_fz_fallback++; rp_end(); }
-    if (g_enc && g_vis_counting && g_vis_n >= VIS_SLOTS) rp_end();   // this draw's query needs a slot and the buffer is bound for the whole pass: the next pass begins with a new one (rp_begin_ex)
-    if (g_enc && g_rp_aw && (!R.has_sc || (long)R.sc.x + R.sc.w > (long)g_rp_aw || (long)R.sc.y + R.sc.h > (long)g_rp_ah)) rp_end();   // leaves the pass's render area
+        g_fz_fallback++; PM_WHY("host:tile-merge-fallback"); rp_end(); }
+    if (g_enc && g_vis_counting && g_vis_n >= VIS_SLOTS) { PM_WHY("host:visibility-slots"); rp_end(); }   // this draw's query needs a slot and the buffer is bound for the whole pass: the next pass begins with a new one (rp_begin_ex)
+    if (g_enc && g_rp_aw && (!R.has_sc || (long)R.sc.x + R.sc.w > (long)g_rp_aw || (long)R.sc.y + R.sc.h > (long)g_rp_ah)) { PM_WHY("host:render-area"); rp_end(); }   // leaves the pass's render area
     fb_prepare(pr);   // same-pass feedback sampling: copy the snapshot first (see fb_prepare)
     if (R.has_sc && !g_enc && !S.rast_discard) {
         NSUInteger tw0 = 0, th0 = 0; rt_dims(&tw0, &th0);
@@ -15134,9 +15338,9 @@ static void draw_(const p_draw *dw, const p_draw_idx *di) {
     int skip_d = mode != 0;
     if (!g_enc) { g_fd_dw = dw; g_fd_di = di; }
     g_rp_layered = pr->sh[0] && pr->sh[0]->layer_out;
-    if (g_enc && g_pass.layered != g_rp_layered) rp_end();   // a layered pass only for layer-writing vertex shaders (see rp_begin_ex)
-    if (g_enc && g_sm_pass && draw_samples_rt(pr)) { PD("M %llu a draw in the slice-merged pass samples its attachment; split here", g_stat_pass); rp_end(); }
-    if (g_enc && g_sm_pass && g_wl.on) { PD("M %llu a wide line in the slice-merged pass: split here", g_stat_pass); rp_end(); }   // its pipeline is not amplified (wl_pso)
+    if (g_enc && g_pass.layered != g_rp_layered) { PM_WHY("jogo:layered-shader-change"); rp_end(); }   // a layered pass only for layer-writing vertex shaders (see rp_begin_ex)
+    if (g_enc && g_sm_pass && draw_samples_rt(pr)) { PD("M %llu a draw in the slice-merged pass samples its attachment; split here", g_stat_pass); PM_WHY("host:slice-merged-samples-attachment"); rp_end(); }
+    if (g_enc && g_sm_pass && g_wl.on) { PD("M %llu a wide line in the slice-merged pass: split here", g_stat_pass); PM_WHY("host:slice-merged-wide-line"); rp_end(); }   // its pipeline is not amplified (wl_pso)
     if (!g_enc && mode == 0 && !g_rp_layered && !defer_q_draw && g_exec_next && !tbdr_on() && !g_geo_program && !g_wl.on && sm_on()) sm_plan(pr);
     vbuf_prepare(pr->sh[0] ? &pr->sh[0]->rf : NULL, dw, di);   // an unaligned GPU-written stream, or one the draw reads past, needs its ordered copy before the render encoder
     id<MTLRenderCommandEncoder> en = rp_begin_ex(mode);
@@ -15171,7 +15375,7 @@ static void draw_(const p_draw *dw, const p_draw_idx *di) {
     else if (g_pso_dirty || pr != cur_pr || cur_ps_pass != g_pass.serial || border != cur_border) { g_pso_amp = g_sm_pass; cur_ps = pso_get(pr, nil); g_pso_amp = 0; cur_pull = g_pso_pull; cur_pr = pr; cur_ps_pass = g_pass.serial; cur_border = border; g_pso_dirty = !cur_ps || cur_pull; }
     if (!cur_ps && g_sm_pass) {   // a draw whose amplified pipeline is not built yet (sm_amp_get queued it): the slice-merged pass ends and the draw opens a pass of its own
         g_sm_nwait++; PD("M %llu slice-merged pass: no amplified pipeline yet for vertex %s fragment %s; split here", g_stat_pass, pr->sh[0] ? pr->sh[0]->key : "-", pr->sh[1] ? pr->sh[1]->key : "-");
-        rp_end(); en = rp_begin_ex(mode); if (!en) return;
+        PM_WHY("host:pipeline-not-ready"); rp_end(); en = rp_begin_ex(mode); if (!en) return;
         cur_ps = pso_get(pr, nil); cur_pull = g_pso_pull; cur_pr = pr; cur_ps_pass = g_pass.serial; cur_border = border; g_pso_dirty = !cur_ps || cur_pull; }
     uint32_t raster_mask = draw_color_writes(pr);   // Capture the physical mapping before resetting the merged pipeline state.
     if (g_pso_lmap) { g_pso_lmap = NULL; g_pso_fsfn = nil; memset(&g_pso_fz, 0, sizeof g_pso_fz); g_pso_dirty = 1; }   // The next draw fetches again according to its own situation
@@ -15264,7 +15468,7 @@ static void draw_(const p_draw *dw, const p_draw_idx *di) {
             if (g_vis_cur >= 0 && g_enc_vis != g_vis_cur + 1) { enc_r_visibility(en, MTLVisibilityResultModeCounting, (NSUInteger)g_vis_cur * 8); g_enc_vis = g_vis_cur + 1; }
         }
     }
-    g_stat_draw++;
+    g_stat_draw++; pm_draw(pr->sh[0] ? pr->sh[0]->key : (pr->sh[2] ? pr->sh[2]->key : NULL), pr->sh[1] ? pr->sh[1]->key : NULL, g_mtk.on || g_geo_mesh.on);
     if (enc_label_on() && !g_el_draws++ && pr->sh[1]) { memcpy(g_el_key, pr->sh[1]->key, 8); g_el_key[8] = 0; }
     if (passdump()) {   // Characteristics of a render pass's first draw (to judge whether the load can be omitted: full screen, no blending, writes all channels, does not depend on depth); with DM_NVN_PASSDUMP_ALL every draw is recorded
         static uint64_t last_pass = ~0ull; static int all = -1; if (all < 0) all = getenv("DM_NVN_PASSDUMP_ALL") != NULL;
@@ -15474,6 +15678,7 @@ void mtl_prog_prefetch(const prog_t *cp) {
 // run about 1,060 small dispatches a frame, and the Mac GPU went from 6.7 to 16 ms a frame at the same draws, the iPhone's from 15 to about 50 (17 fps).
 // DM_NVN_DISPATCH_OWN=1 gives each dispatch its own encoder again (so does DM_NVN_PASSGPU, which times each one)
 static int dispatch_own(void) {
+    if (pm_own()) return 1;   // DM_NVN_PASSMAP: a sampled frame times each dispatch in an encoder of its own
     static int v = -1;
     if (v < 0) { const char *e = getenv("DM_NVN_DISPATCH_OWN"); v = (e && !strcmp(e, "1")) || pg_on(); if (v) MLOG("compute dispatches: each in an encoder of its own (DM_NVN_DISPATCH_OWN=1 or DM_NVN_PASSGPU)"); }
     return v;
@@ -15619,7 +15824,7 @@ static void dispatch(const p_dispatch *dp) {
     // A store the shader makes on its very first invocation only, before the others run on the Switch: the build takes it out of the shader (dmsh_rewrite.py first_store), as Apple's GPUs start workgroups in no order
     if (dp->ind || (dp->x && dp->y && dp->z)) for (int i = 0; i < cs->rf.nfirst; i++) { const p_bind_buf *u = &S.ssbo[5][cs->rf.first[i].reg]; if (u->addr) mtl_sub_fill(u->addr + 4ull * cs->rf.first[i].word, 4, cs->rf.first[i].value); }
     if (g_nubd && ubd_conflict_cs(cs, dp->ind)) { g_ubd_conflicts++; ubd_land(); }   // see ubd_conflict_cs
-    rp_flush();   // A full clear with no draw after it waits for the next pass on its targets, but it comes before this dispatch, which may read or write them as images: land it first, as copy_t2t does
+    PM_WHY("jogo:dispatch"); rp_flush();   // A full clear with no draw after it waits for the next pass on its targets, but it comes before this dispatch, which may read or write them as images: land it first, as copy_t2t does
     image_prepare(prog_get(S.cprog), 0x20);
     if (ndve_engine_dispatch(cs, dp)) return;   // nn::ndve's movie network as the host's kernels (DM_NDVE_ENGINE=1)
     if (up_mfx_wanted(cs) && !dp->ind && up_mfx_encode(cs)) return;   // the game's upscaler, drawn by MetalFX instead (DM_UPSCALER=metalfx)
@@ -15644,7 +15849,7 @@ static void dispatch(const p_dispatch *dp) {
     // or before dispatch_enc's copy-to-dispatch barrier: otherwise the upgrade opens a second encoder, or its copy races the dispatch (#1743).
     encode_args(nil, cs, 5, 0);
     if (own && g_blit) { enc_b_end(g_blit); g_blit = nil; }
-    id<MTLComputeCommandEncoder> ce = own ? pg_compute() : (id<MTLComputeCommandEncoder>)dispatch_enc_cs(cs, dp->ind);
+    id<MTLComputeCommandEncoder> ce = own ? pg_compute() : (id<MTLComputeCommandEncoder>)dispatch_enc_cs(cs, dp->ind); pm_dispatch(cs->key);
     enc_c_pso(ce, ps);
     if (tg_groups) {
         __strong id<MTLBuffer> tb = nil; size_t to = arena_alloc((size_t)(tg_groups * cs->rf.tg_spill), &tb);
@@ -16435,7 +16640,7 @@ static void pass_split_try(void) {
     if (g_split_pass != g_setrt_n) { g_split_pass = g_setrt_n; g_split_n = 0; }
     if (pass_split_max() > 0 && g_split_n >= pass_split_max()) return;
     g_split_n++;
-    g_split_store = 1; rp_end(); g_split_store = 0;
+    g_split_store = 1; PM_WHY("host:pass-split"); rp_end(); g_split_store = 0;
     sub_cut(); g_split_resume = 1;
     if (!g_pass_splits++) MLOG("pass split: a long render pass was ended and its segment committed while the GPU had nothing to do (DM_NVN_PASS_SPLIT=%d, frame %llu pass %llu)", n, (unsigned long long)atomic_load(&g_cur_frame), g_stat_pass);
 }
@@ -16630,7 +16835,7 @@ void mtl_exec(const uint8_t *p) {
                 if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) {
                     if (!g_vis_on) {   // a report with no reset before it: the counter runs from the queue's creation, so counting starts here (Occlusion queries)
                         g_vis_on = 1; g_vis_counting = 1; MLOG("occlusion queries: samples passed reported with no ResetCounter before it: counting from this report");
-                        if (g_enc && !g_enc_has_vis) { PD("M %llu occlusion query counting starts at a report: render pass split here", g_stat_pass); rp_end(); } }
+                        if (g_enc && !g_enc_has_vis) { PD("M %llu occlusion query counting starts at a report: render pass split here", g_stat_pass); PM_WHY("host:occlusion-query-split"); rp_end(); } }
                     hw_note(ad); post((post_op){3, NULL, VIS_REPORT, 0, ad, (uint32_t)t, vis_snapshot()}); vis_clear(); }   // written at completion, as a counter report
                 else mtl_sub_counter(ad, (uint32_t)t);
                 break; }
@@ -16650,7 +16855,7 @@ void mtl_exec(const uint8_t *p) {
                     g_vis_on = 1; g_vis_counting = 1; vis_clear(); post((post_op){3, NULL, VIS_ZERO, 0, 0, (uint32_t)t, NULL});
                     // The first reset can come inside a render pass that was begun without a visibility buffer (Octopath Traveler 0: Unreal's occlusion queries, once at boot): split the pass
                     // here, so the continuation is begun with the buffer and its samples are counted (they used not to be: RED "occlusion query counting began in a pass without a visibility buffer")
-                    if (g_enc && !g_enc_has_vis) { PD("M %llu occlusion query counting starts: render pass split here", g_stat_pass); rp_end(); } }
+                    if (g_enc && !g_enc_has_vis) { PD("M %llu occlusion query counting starts: render pass split here", g_stat_pass); PM_WHY("host:occlusion-query-split"); rp_end(); } }
                 break; }
             case OP_CLEAR_BUF: { const p_clear_buf *cb = a; mtl_sub_fill(cb->addr, cb->size, cb->value); break; }
             case OP_COPY_B2B: { uint64_t s_, d, n; memcpy(&s_, a, 8); memcpy(&d, (const uint8_t *)a + 8, 8); memcpy(&n, (const uint8_t *)a + 16, 8);
@@ -16672,7 +16877,7 @@ void mtl_exec(const uint8_t *p) {
                 if (g_enc && g_sm_pass && !pend && !g_game_barrier) { int sl;   // another layer of the slice-merged pass's level (sm_scan planned it)
                     if (sm_rt_slice(&R.rt, r, &sl) && sl >= g_sm_lo && sl <= g_sm_hi) { R.rt = *r; g_sm_cur = sl; g_sm_ncont++;
                         { void td_note_layer(id<MTLTexture>, uint64_t, NSUInteger, NSUInteger); td_note_layer(tex_mtl(r->color[0]), r->color[0]->serial, r->cview[0].set_levels ? r->cview[0].base_level : 0, (NSUInteger)sl); } PD("M %llu slice-merged pass goes on in layer %d", g_stat_pass, sl); break; } }
-                if (pend && !g_enc && g_cb && lc_on()) lc_push(); else rp_flush();   // clears with no draw wait for the next pass that attaches their targets (lc_push)
+                if (pend && !g_enc && g_cb && lc_on()) lc_push(); else { PM_WHY("jogo:SetRenderTargets"); rp_flush(); }   // clears with no draw wait for the next pass that attaches their targets (lc_push)
                 sub_cut(); R.rt = *r; R.has_rt = 1; break;
             }
             case OP_CLEAR_COLOR: {
@@ -16681,7 +16886,7 @@ void mtl_exec(const uint8_t *p) {
                 // A scissored clear to 0 outside a pass with all channels (SMBW clears pyramid levels as sub-rectangles of 480×272 and other targets): copy from the zero buffer into the scissor rectangle in the replay stream
                 if (!g_enc && c->mask == 0xf && !c->rgba[0] && !c->rgba[1] && !c->rgba[2] && !c->rgba[3] && R.has_sc && c->index >= 0 && c->index < R.rt.n && R.rt.color[c->index]
                     && !scissor_full(R.rt.color[c->index], &R.rt.cview[c->index], R.rt.has_cview[c->index]) && clear_rect_zero(c->index)) break;
-                if (g_rt_merged || g_sm_pass) rp_end();   // A clear arrived in a continued render pass: end it here, and the clear is attached to the start of the next render pass as usual
+                if (g_rt_merged || g_sm_pass) { PM_WHY("jogo:clear-in-continued-pass"); rp_end(); }   // A clear arrived in a continued render pass: end it here, and the clear is attached to the start of the next render pass as usual
                 if (c->index < 0 || c->index >= R.rt.n || !R.rt.color[c->index]) { RED_ONCE(5, "color clear target %d invalid", c->index); break; }
                 if (g_enc || c->mask != 0xf || !scissor_full(R.rt.color[c->index], &R.rt.cview[c->index], R.rt.has_cview[c->index])) {
                     // Inside a pass, with a partial mask or a partial scissor: drawn as a triangle (clear_color_tri)
@@ -16695,7 +16900,7 @@ void mtl_exec(const uint8_t *p) {
             case OP_CLEAR_DS: {
                 const p_clear_ds *c = a;
                 if (g_rc_skip) { PD("c %llu depth-stencil clear skipped by conditional rendering", g_stat_pass); break; }
-                if (g_rt_merged || g_sm_pass) rp_end();
+                if (g_rt_merged || g_sm_pass) { PM_WHY("jogo:clear-in-continued-pass"); rp_end(); }
                 // A load-action clear covers the whole attachment and every stencil bit. A clear whose scissor does not cover the depth target, or whose stencil mask is partial, is drawn as a triangle
                 // (clear_ds_tri), in or before a pass: before the first draw and for a partial stencil mask in a pass it used to clear the whole target (PR #108)
                 unsigned sm = (unsigned)c->stencil_mask & 0xff;
@@ -16709,7 +16914,7 @@ void mtl_exec(const uint8_t *p) {
                 // It used to be skipped, and later draws depth-tested against stale depth
                 if (g_enc) {
                     { static int once; if (!once++) MLOG("mid-pass depth-stencil clear: ending this pass; the clear moves to the start of the next pass (first case pass %llu)", g_stat_pass); }
-                    rp_end();
+                    PM_WHY("jogo:depth-clear-mid-pass"); rp_end();
                 }
                 if (c->depth_mask) { R.clear_d = 1; R.cd = c->depth; }
                 if (c->stencil_mask) { R.clear_s = 1; R.cs = (uint32_t)c->stencil; }
@@ -16756,7 +16961,7 @@ void mtl_exec(const uint8_t *p) {
             case OP_BARRIER: { int32_t bits; memcpy(&bits, a, 4);   // ordered at the next draw pass (barrier_game); inside a pass with shader writes, the pass ends first (swrite_note); in one without, before its next write (prog_swrites)
                 int order = g_enc && (bits & (NVN_BARRIER_ORDER_PRIMITIVES_BIT | NVN_BARRIER_ORDER_FRAGMENTS_BIT | NVN_BARRIER_ORDER_FRAGMENTS_TILED_BIT)), split = order && g_pass_swrite;
                 PD("I %llu barrier bits %#x%s", g_stat_pass, bits, split ? ": ends the pass (shader writes)" : order ? " (render pass open; a later shader write is ordered after its draws)" : g_enc ? " (render pass open)" : "");
-                if (split) { rp_end(); static int once; if (!once++) MLOG("a game barrier (bits %#x) after shader writes in a draw pass: the pass ends there (first case pass %llu)", bits, (unsigned long long)g_stat_pass); }
+                if (split) { PM_WHY("jogo:barrier-after-shader-writes"); rp_end(); static int once; if (!once++) MLOG("a game barrier (bits %#x) after shader writes in a draw pass: the pass ends there (first case pass %llu)", bits, (unsigned long long)g_stat_pass); }
                 else if (order) g_pass_order |= (bits & NVN_BARRIER_ORDER_PRIMITIVES_BIT ? 1 : 0) | (bits & (NVN_BARRIER_ORDER_FRAGMENTS_BIT | NVN_BARRIER_ORDER_FRAGMENTS_TILED_BIT) ? 2 : 0);
                 if (g_tf_enc && (bits & (NVN_BARRIER_ORDER_PRIMITIVES_BIT | NVN_BARRIER_ORDER_FRAGMENTS_BIT | NVN_BARRIER_ORDER_FRAGMENTS_TILED_BIT))) g_tf_bar = 1;   // the next capture of the open capture pass waits for its earlier ones (tf_order)
                 if ((bits & NVN_BARRIER_ORDER_INDIRECT_DATA_BIT) && g_mdx_wr != ~0ull && g_mdx_wr != g_vbuf_write_epoch) g_mdx_epoch++;   // a draw may have written a record that was copied before it (g_mdx_wr)
@@ -17515,6 +17720,7 @@ static int up_mfx_encode(NvShader *cs) {
         sc.colorTexture = color; sc.outputTexture = result; sc.inputContentWidth = cw; sc.inputContentHeight = ch;
         [sc encodeToCommandBuffer:cb];
     });
+    g_pm_mfx = 1;   // DM_NVN_PASSMAP: the next encoder's idle gap holds the scaler's time
     if (!sout && !copy_t2t_draw(drawn, out, 0, 0, 0, 0, &at0o, &orr, 0, 0)) {
         args_dirty_all(); g_up_mfx_kept++; return 0;   // only the scratch image was scaled; the game's shader can still produce the output
     }
