@@ -40,6 +40,7 @@ def fixture(root, names=NAMES, hle=HLE, obj=OBJ, mtl=MTL, judg=JUDG, table=True)
     if table:
         rows, _ = tool.analyze(root)
         (Path(root) / tool.TABLE).write_text(tool.render(rows), encoding='utf-8')
+        (Path(root) / tool.SVG).write_text(tool.svg(rows), encoding='utf-8')
     return root
 
 
@@ -65,6 +66,15 @@ class Repository(unittest.TestCase):
         a, _ = tool.analyze(REPO)
         b, _ = tool.analyze(REPO)
         self.assertEqual(tool.render(a), tool.render(b))
+        self.assertEqual(tool.svg(a), tool.svg(b))
+
+    def test_picture_is_plain_and_has_one_cell_per_name(self):
+        rows, _ = tool.analyze(REPO)
+        pic = tool.svg(rows)
+        self.assertEqual(pic.count('<title>' + rows[0]['name'] + ': '), 1)
+        self.assertEqual(sum(pic.count('<title>%s: ' % r['name']) for r in rows), len(rows))
+        for bad in ('<script', 'href=', 'url(', '@import', 'currentColor', 'http://www.w3.org/1999/xlink'):
+            self.assertNotIn(bad, pic)
 
 
 class Fixture(unittest.TestCase):
@@ -147,6 +157,14 @@ class Fixture(unittest.TestCase):
             self.assertEqual(rc, 1)
             self.assertIn('-nvnGone', out)
             self.assertIn('+nvnGone', out)
+
+    def test_stale_picture(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = fixture(Path(d) / 'repo')
+            (Path(root) / tool.SVG).write_text('<svg/>\n', encoding='utf-8')
+            rc, out = check(root)
+            self.assertEqual(rc, 1)
+            self.assertIn(tool.SVG + ' is not what the sources give', out)
 
     def test_gaps_lists_what_a_game_calls_before_what_it_carries(self):
         with tempfile.TemporaryDirectory() as d:
