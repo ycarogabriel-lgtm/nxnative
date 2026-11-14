@@ -2093,6 +2093,8 @@ static void tsummary(uint64_t frame) {
     }
     LOG("[nvn] timing up to frame %llu:%s", frame, line);
     { void mtl_pso_line(char *, size_t); char pl[1024]; mtl_pso_line(pl, sizeof pl); LOG("[nvn] pipelines up to frame %llu: %s", frame, pl); }
+    { int mtl_pso_look_line(char *, size_t); char xl[2048];   // DM_PSO_LOOKTIME / DM_PSO_SIGNALLOG / DM_PSO_PREDICT_ASYNC, DM_PSO_SUBMIT_NOLOOKUP: nothing when off
+      if (mtl_pso_look_line(xl, sizeof xl)) LOG("[pso-look] up to frame %llu: %s", frame, xl); }
     double tgt = 1000.0 / mtl_fps_target();   // milliseconds one frame should take: 16.7 at 60 fps, 33.3 when the game itself asks for 30 (the over-time / dropped-frame counts below use it)
     { unsigned n = g_tn[0] < TWIN ? g_tn[0] : TWIN, over = 0; double v[TWIN];   // frame interval gets its own line (M1 baseline): number of frames longer than one frame period in this window and p99
       if (n) { memcpy(v, g_tw[0], n * sizeof *v); qsort(v, n, sizeof *v, dcmp); for (unsigned i = 0; i < n; i++) over += v[i] > tgt;

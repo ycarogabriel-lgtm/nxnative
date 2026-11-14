@@ -9112,12 +9112,55 @@ static _Atomic uint64_t g_arch_asks;
 // A pipeline from the archive: the file the index names for its key alone, else each file without a complete index (the bundle first among the p files, which plain skips: a base
 // with a vertex layout and a compute pipeline are never in one). *from_run: it came from a run file this compaction takes, so the compacting prewarm captures it again
 static int arch_compact_takes(id<MTL4Archive> a);
+// DM_PSO_LOOKTIME=1 (diagnostic, off by default): each ask of an archive file (the Metal call that returns a pipeline or nothing) is timed on the wall clock and on the asking thread's CPU
+// clock, with the process's page-in count before and after (TASK_EVENTS_INFO: the whole process's, since macOS has no per-thread count, so asks that overlap on several workers count
+// each other's page-ins), and summed per window of 300 frames into the "[pso-look]" line (mtl_pso_look_line): the submit thread apart from the workers, with wall time p50 / p95 / max.
+// wall about CPU: the Metal call's own work; wall far over CPU with page-ins: reading the archive's pages; wall far over CPU with none: waiting (a lock, the compiler service)
+static int look_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_PSO_LOOKTIME"); v = e && !strcmp(e, "1"); } return v; }
+enum { LK_CAP = 16384 };   // wall times kept per class and window for the percentiles (a window with more asks keeps the first LK_CAP of them in them; the sums count all)
+static struct { uint64_t n, found, wall_ns, cpu_ns, pageins, max_ns; uint32_t nus; uint32_t us[LK_CAP]; } g_lk[2];   // [0] the submit thread, [1] every other thread
+static os_unfair_lock g_lk_lock = OS_UNFAIR_LOCK_INIT;
+static uint64_t look_pageins(void) {
+    task_events_info_data_t ti; mach_msg_type_number_t c = TASK_EVENTS_INFO_COUNT;
+    return task_info(mach_task_self(), TASK_EVENTS_INFO, (task_info_t)&ti, &c) == KERN_SUCCESS ? (uint64_t)(uint32_t)ti.pageins : 0;
+}
+static void look_note(int found, uint64_t w0, uint64_t c0, uint64_t p0) {
+    uint64_t w = bp_now() - w0, c = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) - c0, p = look_pageins() - p0;
+    int cls = on_sub_thread() ? 0 : 1;
+    os_unfair_lock_lock(&g_lk_lock);
+    g_lk[cls].n++; g_lk[cls].found += found != 0; g_lk[cls].wall_ns += w; g_lk[cls].cpu_ns += c; g_lk[cls].pageins += p; if (w > g_lk[cls].max_ns) g_lk[cls].max_ns = w;
+    if (g_lk[cls].nus < LK_CAP) g_lk[cls].us[g_lk[cls].nus++] = w / 1000 > UINT32_MAX ? UINT32_MAX : (uint32_t)(w / 1000);
+    os_unfair_lock_unlock(&g_lk_lock);
+}
+static int look_cmp(const void *a, const void *b) { uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b; return x < y ? -1 : x > y; }
+// The "[pso-look]" line of the timing summary (hle_nvn.c), the window since the last call; 0 (no line) when the switch is off
+int mtl_pso_look_line(char *o, size_t n) {
+    if (!look_on()) return 0;
+    static uint64_t pp; uint64_t pn = look_pageins(), dp = pn - pp; pp = pn;
+    size_t k = 0; o[0] = 0;
+    for (int cls = 0; cls < 2; cls++) {
+        os_unfair_lock_lock(&g_lk_lock);
+        typeof(g_lk[0]) *s = malloc(sizeof *s); memcpy(s, &g_lk[cls], sizeof *s); memset(&g_lk[cls], 0, sizeof g_lk[cls]);
+        os_unfair_lock_unlock(&g_lk_lock);
+        if (s->nus) qsort(s->us, s->nus, sizeof s->us[0], look_cmp);
+        double p50 = s->nus ? s->us[s->nus / 2] / 1e3 : 0, p95 = s->nus ? s->us[(uint64_t)s->nus * 95 / 100 < s->nus ? (uint64_t)s->nus * 95 / 100 : s->nus - 1] / 1e3 : 0;
+        k += snprintf(o + k, n > k ? n - k : 0, "%s n %llu (found %llu), wall %.1f ms, cpu %.1f ms, pageins %llu, wall p50 %.2f / p95 %.2f / max %.2f ms",
+                      cls ? "; workers:" : "submit thread:", (unsigned long long)s->n, (unsigned long long)s->found, s->wall_ns / 1e6, s->cpu_ns / 1e6, (unsigned long long)s->pageins, p50, p95, s->max_ns / 1e6);
+        free(s);
+    }
+    snprintf(o + k, n > k ? n - k : 0, "; process pageins in the window %llu (a thread's pageins are the process's during its ask: asks that overlap count each other's)", (unsigned long long)dp);
+    return 1;
+}
 static id arch_lookup(MTL4PipelineDescriptor *d, int plain, int *from_run) {
     if (from_run) *from_run = 0;
     int compute = [d isKindOfClass:MTL4ComputePipelineDescriptor.class];
     id (^ask)(id<MTL4Archive>) = ^id(id<MTL4Archive> a) {
         atomic_fetch_add_explicit(&g_arch_asks, 1, memory_order_relaxed);
-        return compute ? (id)[a newComputePipelineStateWithDescriptor:(MTL4ComputePipelineDescriptor *)d error:nil] : (id)[a newRenderPipelineStateWithDescriptor:d error:nil];
+        int lk = look_on(); uint64_t w0 = 0, c0 = 0, p0 = 0;
+        if (lk) { w0 = bp_now(); c0 = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID); p0 = look_pageins(); }
+        id r = compute ? (id)[a newComputePipelineStateWithDescriptor:(MTL4ComputePipelineDescriptor *)d error:nil] : (id)[a newRenderPipelineStateWithDescriptor:d error:nil];
+        if (lk) look_note(r != nil, w0, c0, p0);
+        return r;
     };
     uint64_t k = g_arch_ix.n ? arch_key(d) : 0;
     id<MTL4Archive> named = k ? (__bridge id<MTL4Archive>)nvn_hm_get(&g_arch_ix, &k) : nil;
@@ -9900,9 +9943,13 @@ static dispatch_queue_t pp_bg_queue(void) {
     return q[atomic_fetch_add(&rr, 1) % (unsigned)n];
 }
 // Draws that waited for their pipeline on the submit thread, by why no stand-in served them: 0 hybrid pipelines off, 1 merged pass or readable-tile fragment, 2 diagnostic fragment,
-// 3 no pulling entry (layer-writing or transform feedback vertex shader, or no pulling library), 4 pulling base not made yet; count and time (prediction walks left out)
-static uint64_t g_pw_n[5], g_pw_ns[5];
-static const char *const g_pw_why[5] = {"hybrid off", "merged pass or readable tile", "diagnostic fragment", "no pulling entry", "pulling base not made yet"};
+// 3 no pulling entry (layer-writing or transform feedback vertex shader, or no pulling library), 4 pulling base not made yet, 5 the draw found its own base (with its vertex layout), in
+// the archive on the submit thread: counted as 4 until the archive search was told apart from a real wait (the 1,452 "waits" of the 2026-11-14 session were these, with 0 misses with no
+// pulling base ready); count and time (prediction walks left out)
+enum { PW_N = 6 };
+static uint64_t g_pw_n[PW_N], g_pw_ns[PW_N];
+static const char *const g_pw_why[PW_N] = {"hybrid off", "merged pass or readable tile", "diagnostic fragment", "no pulling entry", "pulling base not made yet",
+                                           "found its own base without compiling (counted before as: pulling base not made yet)"};
 // Takes a slot for k (with g_pp_mu held): a free one, else the oldest finished entry no draw took (its worker no longer touches it). spec: a speculative build, refused while
 // PSO_PEND_ACTIVE speculative builds run. Returns the slot, -1 when refused or k is in the table already
 static int pso_pend_slot(const pso_key *k, int spec, uint32_t *gen) {
@@ -10019,9 +10066,9 @@ void mtl_pso_line(char *o, size_t n) {
              d[0] / 1e6, d[1] / 1e6, (unsigned long long)d[10], d[11] / 1e6, (unsigned long long)d[18], (unsigned long long)d[2], d[3] / 1e6, (unsigned long long)d[4], d[5] / 1e6, (unsigned long long)d[6], d[7] / 1e6,
              (unsigned long long)d[8], d[9] / 1e6, (unsigned long long)d[12], (unsigned long long)d[13], (unsigned long long)d[17], (unsigned long long)d[14], (unsigned long long)d[15], (unsigned long long)d[16], (unsigned long long)(v[14] - v[15] - v[16]));
     memcpy(p, v, sizeof p);
-    static uint64_t pn[5], pns[5]; size_t o2 = strlen(o);
+    static uint64_t pn[PW_N], pns[PW_N]; size_t o2 = strlen(o);
     o2 += snprintf(o + o2, n > o2 ? n - o2 : 0, "; draws that waited:");
-    for (int i = 0; i < 5; i++) if (g_pw_n[i] > pn[i]) o2 += snprintf(o + o2, n > o2 ? n - o2 : 0, " %s %llu / %.1f ms,", g_pw_why[i], (unsigned long long)(g_pw_n[i] - pn[i]), (g_pw_ns[i] - pns[i]) / 1e6);
+    for (int i = 0; i < PW_N; i++) if (g_pw_n[i] > pn[i]) o2 += snprintf(o + o2, n > o2 ? n - o2 : 0, " %s %llu / %.1f ms,", g_pw_why[i], (unsigned long long)(g_pw_n[i] - pn[i]), (g_pw_ns[i] - pns[i]) / 1e6);
     memcpy(pn, g_pw_n, sizeof pn); memcpy(pns, g_pw_ns, sizeof pns);
     static uint64_t pca, pcr, pcb, pcl, pcn; uint64_t ca = g_cps_arch, cr = g_cps_run, cb = g_cps_built, cl = g_cps_look_ns, cn = g_cps_build_ns;   // compute pipelines (cps_new)
     if (ca > pca || cr > pcr || cb > pcb)
@@ -10323,6 +10370,7 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get_(NvProg *pr, MTLRe
         if (st == 2) took = 1;   // built in the background (nil: it failed, and is built again below for its message)
         else {
             if (st == 0) ps = pso_build_ex(pso_desc(&k, vs, fs, nil, 0), !k.border, &e, 0);   // its base made or archived: no compile
+            if (st == 0 && ps) why = 5;   // found: not a wait for a pulling base (it was counted as one)
             if (!ps) {
                 // Demand first (main's order): the draw's own pipeline is queued before the prediction admits speculative builds; with a stand-in nothing waits for it
                 __unsafe_unretained id<MTLRenderPipelineState> h = hybrid_get(&k, vs, fs);
